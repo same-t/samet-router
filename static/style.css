@@ -1,0 +1,24 @@
+:root { --bg:#0f1420; --panel:#171e2e; --line:#263049; --txt:#e8ecf4; --mut:#9aa6bf; --acc:#5aa2ff; }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--txt); font:14px/1.5 system-ui, Segoe UI, Roboto, sans-serif; }
+.layout { display:flex; min-height:100vh; }
+.sidebar { width:230px; background:var(--panel); border-right:1px solid var(--line); padding:18px 12px; display:flex; flex-direction:column; gap:14px; }
+.brand { font-weight:800; font-size:18px; }
+.sidebar nav { display:flex; flex-direction:column; gap:6px; }
+.sidebar nav button { text-align:left; background:transparent; color:var(--txt); border:1px solid transparent; padding:9px 12px; border-radius:9px; cursor:pointer; }
+.sidebar nav button.active, .sidebar nav button:hover { background:#202a44; border-color:var(--line); }
+.side-foot { margin-top:auto; color:var(--mut); font-size:12px; }
+.content { flex:1; padding:22px 26px; max-width:1050px; }
+header { display:flex; align-items:center; gap:12px; }
+.pill { background:#22304f; border:1px solid var(--line); padding:4px 10px; border-radius:99px; font-size:12px; color:var(--mut); }
+.cards { display:flex; gap:12px; margin:14px 0 20px; }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 18px; min-width:130px; }
+.num { font-size:26px; font-weight:800; } .lbl { color:var(--mut); font-size:12px; }
+.row { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0; }
+input { background:#0d1322; border:1px solid var(--line); color:var(--txt); padding:8px 10px; border-radius:8px; }
+button { background:var(--acc); border:none; color:#06122b; font-weight:700; padding:8px 14px; border-radius:8px; cursor:pointer; }
+table { width:100%; border-collapse:collapse; margin-top:10px; background:var(--panel); border-radius:10px; overflow:hidden; }
+th, td { padding:9px 10px; border-bottom:1px solid var(--line); text-align:left; font-size:13px; }
+.hint { color:var(--mut); } .hidden { display:none; }
+pre { background:#0b1120; border:1px solid var(--line); padding:14px; border-radius:10px; overflow:auto; }
+small { color:var(--mut); }

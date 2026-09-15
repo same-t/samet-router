@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Samet Router — Admin</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">◈ Samet Router</div>
+    <nav>
+      <button data-tab="dashboard" class="active">Genel</button>
+      <button data-tab="keys">API Keys</button>
+      <button data-tab="models">Modeller</button>
+      <button data-tab="logs">Loglar</button>
+      <button data-tab="docs">Doküman</button>
+    </nav>
+    <div class="side-foot">Backend: Gemini<br/>Uyumluluk: OpenAI · Anthropic · Gemini</div>
+  </aside>
+  <main class="content">
+    <header><h1>Admin Panel</h1><span id="status" class="pill">yükleniyor…</span></header>
+
+    <section id="tab-dashboard" class="tab">
+      <div class="cards">
+        <div class="card"><div class="num" id="stat-keys">0</div><div class="lbl">Gemini Key</div></div>
+        <div class="card"><div class="num" id="stat-models">0</div><div class="lbl">Model</div></div>
+        <div class="card"><div class="num" id="stat-logs">0</div><div class="lbl">Log (son 50)</div></div>
+      </div>
+      <h3>Hızlı key ekle</h3>
+      <div class="row">
+        <input id="quick-key" placeholder="AIza... (Gemini API key)" size="42" />
+        <input id="quick-label" placeholder="etiket (opsiyonel)" />
+        <button onclick="addKey(true)">Ekle</button>
+      </div>
+      <p class="hint">Key'ler arkada saklanır, istemcilere asla gösterilmez. İstekler sırayla (round-robin) key'ler arasında dağıtılır.</p>
+    </section>
+
+    <section id="tab-keys" class="tab hidden">
+      <h3>Gemini API Keys</h3>
+      <div class="row">
+        <input id="key-value" placeholder="AIza..." size="42" />
+        <input id="key-label" placeholder="etiket" />
+        <button onclick="addKey(false)">Ekle</button>
+      </div>
+      <table><thead><tr><th>ID</th><th>Etiket</th><th>Maskeli</th><th>Oluşturma</th><th></th></tr></thead>
+      <tbody id="keys-body"></tbody></table>
+    </section>
+
+    <section id="tab-models" class="tab hidden">
+      <h3>Model eşlemeleri <small>(router adı → gerçek gemini modeli)</small></h3>
+      <div class="row">
+        <input id="model-name" placeholder="samet-flash" />
+        <input id="model-gemini" placeholder="gemini-2.0-flash" />
+        <input id="model-desc" placeholder="açıklama" />
+        <button onclick="addModel()">Ekle</button>
+      </div>
+      <table><thead><tr><th>Router adı</th><th>Gemini modeli</th><th>Açıklama</th><th></th></tr></thead>
+      <tbody id="models-body"></tbody></table>
+    </section>
+
+    <section id="tab-logs" class="tab hidden">
+      <h3>Son istekler</h3>
+      <button onclick="refresh()">Yenile</button>
+      <table><thead><tr><th>Zaman</th><th>Endpoint</th><th>Model</th><th>OK</th><th>ms</th><th>Hata</th></tr></thead>
+      <tbody id="logs-body"></tbody></table>
+    </section>
+
+    <section id="tab-docs" class="tab hidden">
+      <h3>İstemci örnekleri</h3>
+      <pre><code># OpenAI uyumlu (python)
+from openai import OpenAI
+c = OpenAI(base_url="http://localhost:8000/v1", api_key="bos-birakilabilir")
+print(c.chat.completions.create(model="samet-flash",
+      messages=[{"role":"user","content":"Merhaba"}]).choices[0].message.content)
+
+# Anthropic uyumlu
+import anthropic
+c = anthropic.Anthropic(base_url="http://localhost:8000", api_key="x")
+print(c.messages.create(model="samet-flash", max_tokens=200,
+      messages=[{"role":"user","content":"Merhaba"}]).content[0].text)
+
+# Gemini uyumlu (ham REST)
+# POST http://localhost:8000/v1beta/models/samet-flash:generateContent
+# {"contents":[{"role":"user","parts":[{"text":"Merhaba"}]}]}</code></pre>
+    </section>
+  </main>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+document.querySelectorAll('.sidebar nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('.sidebar nav button').forEach(x => x.classList.remove('active'));
+  b.classList.add('active');
+  document.querySelectorAll('.tab').forEach(t => t.classList.add('hidden'));
+  $('tab-' + b.dataset.tab).classList.remove('hidden');
+});
+async function refresh() {
+  const r = await fetch('/admin/api/state');
+  const s = await r.json();
+  $('status').textContent = s.router_auth_required ? 'router auth: AÇIK' : 'router auth: KAPALI (local)';
+  $('stat-keys').textContent = s.keys.length;
+  $('stat-models').textContent = s.models.length;
+  $('stat-logs').textContent = s.logs.length;
+  $('keys-body').innerHTML = s.keys.map(k =>
+    `<tr><td>${k.id}</td><td>${esc(k.label)}</td><td><code>${esc(k.key)}</code></td><td>${esc(k.created_at||'')}</td><td><button onclick="delKey('${k.id}')">Sil</button></td></tr>`).join('');
+  $('models-body').innerHTML = s.models.map(m =>
+    `<tr><td><code>${esc(m.name)}</code></td><td>${esc(m.gemini_model)}</td><td>${esc(m.description||'')}</td><td><button onclick="delModel('${esc(m.name)}')">Sil</button></td></tr>`).join('');
+  $('logs-body').innerHTML = s.logs.map(l =>
+    `<tr><td>${esc(l.ts||'')}</td><td>${esc(l.endpoint||'')}</td><td>${esc(l.model||'')}</td><td>${l.ok?'✅':'❌'}</td><td>${l.latency_ms??''}</td><td>${esc(l.error||'')}</td></tr>`).join('');
+}
+function esc(s){ return String(s??'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+async function addKey(quick) {
+  const key = $(quick?'quick-key':'key-value').value.trim();
+  const label = $(quick?'quick-label':'key-label').value.trim();
+  if (!key) return alert('key gir');
+  const r = await fetch('/admin/api/keys', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key, label})});
+  if (!r.ok) return alert('hata: ' + await r.text());
+  $(quick?'quick-key':'key-value').value=''; refresh();
+}
+async function delKey(id){ await fetch('/admin/api/keys/'+id, {method:'DELETE'}); refresh(); }
+async function addModel() {
+  const name = $('model-name').value.trim(), gemini_model = $('model-gemini').value.trim() || 'gemini-2.0-flash', description = $('model-desc').value.trim();
+  if (!name) return alert('model adı gir');
+  const r = await fetch('/admin/api/models', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name, gemini_model, description})});
+  if (!r.ok) return alert('hata: ' + await r.text());
+  refresh();
+}
+async function delModel(n){ await fetch('/admin/api/models/'+encodeURIComponent(n), {method:'DELETE'}); refresh(); }
+refresh();
+</script>
+</body>
+</html>
