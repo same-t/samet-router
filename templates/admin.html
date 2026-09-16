@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="tr">
+<html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -11,79 +11,199 @@
   <aside class="sidebar">
     <div class="brand">◈ Samet Router</div>
     <nav>
-      <button data-tab="dashboard" class="active">Genel</button>
-      <button data-tab="keys">API Keys</button>
-      <button data-tab="models">Modeller</button>
-      <button data-tab="logs">Loglar</button>
-      <button data-tab="docs">Doküman</button>
+      <button data-tab="dashboard" class="active">Dashboard</button>
+      <button data-tab="router-keys">User Keys</button>
+      <button data-tab="keys">Provider Keys</button>
+      <button data-tab="models">Models</button>
+      <button data-tab="prompt">Prompt</button>
+      <button data-tab="logs">Recent Requests</button>
+      <button data-tab="docs">Docs</button>
     </nav>
-    <div class="side-foot">Backend: Gemini<br/>Uyumluluk: OpenAI · Anthropic · Gemini</div>
+    <div class="side-foot">Backend: OpenAI · Anthropic · Gemini<br/>Compatibility: OpenAI · Anthropic · Gemini</div>
   </aside>
   <main class="content">
-    <header><h1>Admin Panel</h1><span id="status" class="pill">yükleniyor…</span></header>
+    <header><h1>Admin Panel</h1><span id="status" class="pill">loading…</span></header>
 
     <section id="tab-dashboard" class="tab">
       <div class="cards">
-        <div class="card"><div class="num" id="stat-keys">0</div><div class="lbl">Gemini Key</div></div>
-        <div class="card"><div class="num" id="stat-models">0</div><div class="lbl">Model</div></div>
-        <div class="card"><div class="num" id="stat-logs">0</div><div class="lbl">Log (son 50)</div></div>
+        <div class="card"><div class="num" id="d-total">0</div><div class="lbl">Total requests</div></div>
+        <div class="card ok"><div class="num" id="d-ok">0</div><div class="lbl">Successful</div></div>
+        <div class="card err"><div class="num" id="d-err">0</div><div class="lbl">Failed</div></div>
+        <div class="card"><div class="num" id="d-rate">%0</div><div class="lbl">Success rate</div></div>
       </div>
-      <h3>Hızlı key ekle</h3>
+      <div class="cards">
+        <div class="card"><div class="num" id="d-in">0</div><div class="lbl">Input tokens</div></div>
+        <div class="card"><div class="num" id="d-out">0</div><div class="lbl">Output tokens</div></div>
+        <div class="card"><div class="num" id="d-tot">0</div><div class="lbl">Total tokens</div></div>
+        <div class="card"><div class="num" id="d-lat">0</div><div class="lbl">Avg. latency (ms)</div></div>
+      </div>
       <div class="row">
-        <input id="quick-key" placeholder="AIza... (Gemini API key)" size="42" />
-        <input id="quick-label" placeholder="etiket (opsiyonel)" />
-        <button onclick="addKey(true)">Ekle</button>
+        <button onclick="refresh()">Refresh</button>
+        <button class="danger" onclick="resetStats()">Reset statistics</button>
       </div>
-      <p class="hint">Key'ler arkada saklanır, istemcilere asla gösterilmez. İstekler sırayla (round-robin) key'ler arasında dağıtılır.</p>
+      <div class="grid2">
+        <div>
+          <h3>By model</h3>
+          <table><thead><tr><th>Model</th><th>Requests</th><th>OK</th><th>Errors</th><th>In</th><th>Out</th></tr></thead>
+          <tbody id="d-by-model"></tbody></table>
+        </div>
+        <div>
+          <h3>By key</h3>
+          <table><thead><tr><th>Key</th><th>Requests</th><th>OK</th><th>Errors</th><th>In</th><th>Out</th></tr></thead>
+          <tbody id="d-by-key"></tbody></table>
+        </div>
+      </div>
+      <h3>Daily (last 14 days)</h3>
+      <table><thead><tr><th>Day</th><th>Requests</th><th>OK</th><th>Errors</th><th>Tokens</th><th>Chart</th></tr></thead>
+      <tbody id="d-by-day"></tbody></table>
+      <h3>By endpoint</h3>
+      <table><thead><tr><th>Endpoint</th><th>Requests</th><th>OK</th><th>Errors</th><th>In</th><th>Out</th></tr></thead>
+      <tbody id="d-by-endpoint"></tbody></table>
+      <h3>By provider <small id="d-thinking"></small></h3>
+      <table><thead><tr><th>Provider</th><th>Requests</th><th>OK</th><th>Errors</th><th>In</th><th>Out</th></tr></thead>
+      <tbody id="d-by-provider"></tbody></table>
+    </section>
+
+    <section id="tab-router-keys" class="tab hidden">
+      <h3>User API Keys <small>(clients connect with these)</small></h3>
+      <p class="hint">Generate a separate key per user. The client sends it via the
+      <code>Authorization: Bearer ...</code> or <code>x-api-key: ...</code> header (Claude Code uses <code>x-api-key</code>).
+      The raw key is shown <b>only at creation time</b> and stored masked afterwards.</p>
+      <div class="row">
+        <input id="rk-label" placeholder="label (e.g.: ali-laptop)" />
+        <button onclick="addRouterKey()">Generate new key</button>
+      </div>
+      <div id="rk-new" class="keybox hidden">
+        <div><b>New key (won't be shown again, copy it now):</b></div>
+        <code id="rk-new-value"></code>
+        <div class="row"><button onclick="copyNewKey()">Copy</button></div>
+      </div>
+      <table><thead><tr><th>Label</th><th>Masked</th><th>Created</th><th>Last used</th><th>Requests</th><th></th></tr></thead>
+      <tbody id="rk-body"></tbody></table>
     </section>
 
     <section id="tab-keys" class="tab hidden">
-      <h3>Gemini API Keys</h3>
+      <h3>Provider Keys <small>(upstream, not shown to clients)</small></h3>
+      <p class="hint">Select <b>which provider a key belongs to</b> (billing/ownership),
+      select <b>which protocol to speak with the key</b> (request format), and
+      set <b>where to send requests</b> via the <code>base URL</code>.
+      Leave it empty to use the provider's default address.</p>
       <div class="row">
-        <input id="key-value" placeholder="AIza..." size="42" />
-        <input id="key-label" placeholder="etiket" />
-        <button onclick="addKey(false)">Ekle</button>
+        <input id="key-value" placeholder="API key" size="36" />
+        <input id="key-label" placeholder="label" />
       </div>
-      <table><thead><tr><th>ID</th><th>Etiket</th><th>Maskeli</th><th>Oluşturma</th><th></th></tr></thead>
+      <div class="row">
+        <label>Provider <select id="key-provider"></select></label>
+        <label>Protocol <select id="key-protocol">
+          <option value="">provider default</option>
+          <option value="openai">OpenAI (chat/completions)</option>
+          <option value="anthropic">Anthropic (messages)</option>
+          <option value="gemini">Gemini (generateContent)</option>
+        </select></label>
+      </div>
+      <div class="row">
+        <input id="key-base" placeholder="base URL (empty = default)" size="46" />
+        <button onclick="addKey()">Add</button>
+      </div>
+      <p class="hint" id="key-default-hint"></p>
+      <table><thead><tr><th>Label</th><th>Provider</th><th>Protocol</th><th>Base URL</th><th>Masked</th><th>Created</th><th></th></tr></thead>
       <tbody id="keys-body"></tbody></table>
+      <p class="hint">Keys speaking the same protocol are pooled; requests are distributed in order (round-robin), and the next key is tried on 401/403/429.</p>
     </section>
 
     <section id="tab-models" class="tab hidden">
-      <h3>Model eşlemeleri <small>(router adı → gerçek gemini modeli)</small></h3>
+      <h3>Model mappings <small>(router name → provider + upstream model)</small></h3>
       <div class="row">
         <input id="model-name" placeholder="samet-flash" />
-        <input id="model-gemini" placeholder="gemini-2.0-flash" />
-        <input id="model-desc" placeholder="açıklama" />
-        <button onclick="addModel()">Ekle</button>
+        <select id="model-provider">
+          <option value="gemini">gemini</option>
+          <option value="openai">openai</option>
+          <option value="anthropic">anthropic</option>
+        </select>
+        <input id="model-upstream" placeholder="upstream model (e.g.: gpt-4o-mini)" size="30" />
+        <input id="model-desc" placeholder="description" />
+        <button onclick="addModel()">Add</button>
       </div>
-      <table><thead><tr><th>Router adı</th><th>Gemini modeli</th><th>Açıklama</th><th></th></tr></thead>
+      <table><thead><tr><th>Router name</th><th>Provider</th><th>Upstream model</th><th>Description</th><th></th></tr></thead>
       <tbody id="models-body"></tbody></table>
     </section>
 
+    <section id="tab-prompt" class="tab hidden">
+      <h3>Default System Prompt <small>(added to all requests)</small></h3>
+      <p class="hint">Leave it empty to use only the client's system/user messages.
+      If set, it is added to OpenAI/Anthropic requests as <code>default + client system</code>.</p>
+      <textarea id="default-system" rows="6" style="width:100%" placeholder="E.g.: Answer briefly..."></textarea>
+      <div class="row"><button onclick="saveSettings()">Save</button></div>
+      <h3>Model suggestion for Claude Code</h3>
+      <p class="hint">Claude Code sends a <code>claude-*</code> model name. Without an alias it falls back
+      to the first model in the list. If you have an Anthropic key, link the alias to the anthropic provider:</p>
+      <div class="row">
+        <input id="alias-claude" placeholder="claude-sonnet-4-5" size="24" />
+        <select id="alias-provider">
+          <option value="anthropic">anthropic</option>
+          <option value="gemini">gemini</option>
+          <option value="openai">openai</option>
+        </select>
+        <input id="alias-upstream" placeholder="upstream model (empty = same name)" size="26" />
+        <button onclick="addClaudeAlias()">Add alias</button>
+      </div>
+    </section>
+
     <section id="tab-logs" class="tab hidden">
-      <h3>Son istekler</h3>
-      <button onclick="refresh()">Yenile</button>
-      <table><thead><tr><th>Zaman</th><th>Endpoint</th><th>Model</th><th>OK</th><th>ms</th><th>Hata</th></tr></thead>
+      <h3>Recent requests <small>(newest first, last 100)</small></h3>
+      <button onclick="refresh()">Refresh</button>
+      <table><thead><tr><th>Time</th><th>Endpoint</th><th>Model</th><th>Provider</th><th>Key</th><th>OK</th><th>ms</th><th>In</th><th>Out</th><th>🧠</th><th>Error</th></tr></thead>
       <tbody id="logs-body"></tbody></table>
     </section>
 
     <section id="tab-docs" class="tab hidden">
-      <h3>İstemci örnekleri</h3>
-      <pre><code># OpenAI uyumlu (python)
+      <h3>Setup order</h3>
+      <pre><code># 1) Add an upstream key from "Provider Keys":
+#      provider=openai  + protocol=openai    → OpenAI / OpenAI-compatible server
+#      provider=anthropic + protocol=anthropic → real Anthropic
+#      provider=gemini  + protocol=gemini    → Google AI Studio (AIza...)
+#      provider=custom  + base URL           → Ollama / vLLM / DeepSeek etc.
+# 2) From "Models", map router name → provider + upstream model
+#    (e.g.: gpt-mini → openai/gpt-4o-mini,  claude-alias → anthropic/claude-sonnet-4-5)
+# 3) From "User Keys", generate a client key (sk-samet-...) and use it in the client.</code></pre>
+      <h3>Client examples</h3>
+      <pre><code># OpenAI-compatible (python, incl. tools + stream)
 from openai import OpenAI
-c = OpenAI(base_url="http://localhost:8000/v1", api_key="bos-birakilabilir")
-print(c.chat.completions.create(model="samet-flash",
-      messages=[{"role":"user","content":"Merhaba"}]).choices[0].message.content)
+c = OpenAI(base_url="http://localhost:8000/v1", api_key="sk-samet-...")
+print(c.chat.completions.create(model="gpt-mini",
+      messages=[{"role":"system","content":"Write briefly"},
+                {"role":"user","content":"Hello"}]).choices[0].message.content)
 
-# Anthropic uyumlu
+# Anthropic-compatible (format used by Claude Code)
 import anthropic
-c = anthropic.Anthropic(base_url="http://localhost:8000", api_key="x")
-print(c.messages.create(model="samet-flash", max_tokens=200,
-      messages=[{"role":"user","content":"Merhaba"}]).content[0].text)
+c = anthropic.Anthropic(base_url="http://localhost:8000", api_key="sk-samet-...")
+print(c.messages.create(model="claude-alias", max_tokens=200,
+      system="Write briefly",
+      messages=[{"role":"user","content":"Hello"}]).content[0].text)
 
-# Gemini uyumlu (ham REST)
+# Extended thinking (passed through as-is to the Anthropic provider):
+print(c.messages.create(model="claude-alias", max_tokens=2000,
+      thinking={"type": "enabled", "budget_tokens": 1000},
+      messages=[{"role":"user","content":"Think deeply"}]).content)
+
+# Claude Code connection (powershell):
+#   $env:ANTHROPIC_BASE_URL = "http://localhost:8000"
+#   $env:ANTHROPIC_AUTH_TOKEN = "sk-samet-..."  # key generated from the panel
+#   $env:ANTHROPIC_MODEL = "claude-alias"
+#   claude
+
+# Gemini-compatible (raw REST)
 # POST http://localhost:8000/v1beta/models/samet-flash:generateContent
-# {"contents":[{"role":"user","parts":[{"text":"Merhaba"}]}]}</code></pre>
+# Headers: x-api-key: sk-samet-...
+# {"contents":[{"role":"user","parts":[{"text":"Hello"}]}]}</code></pre>
+      <h3>Thinking support</h3>
+      <pre><code># Anthropic thinking → Anthropic provider : as-is (signature + redacted preserved)
+# Anthropic thinking → OpenAI/Gemini       : budget is carried over (reasoning_effort /
+#                                            thinkingBudget), blocks cannot be carried over
+# OpenAI reasoning   → Anthropic           : reasoning_content → thinking block
+# Gemini thought     → Anthropic/OpenAI    : if thinking was requested, thinking block /
+#                                            reasoning_content, otherwise dropped
+# Unsigned thinking goes to Anthropic upstream as text (avoids 400 errors).</code></pre>
     </section>
   </main>
 </div>
@@ -95,38 +215,135 @@ document.querySelectorAll('.sidebar nav button').forEach(b => b.onclick = () => 
   document.querySelectorAll('.tab').forEach(t => t.classList.add('hidden'));
   $('tab-' + b.dataset.tab).classList.remove('hidden');
 });
+function fmt(n){ return Number(n||0).toLocaleString('en-US'); }
 async function refresh() {
   const r = await fetch('/admin/api/state');
   const s = await r.json();
-  $('status').textContent = s.router_auth_required ? 'router auth: AÇIK' : 'router auth: KAPALI (local)';
-  $('stat-keys').textContent = s.keys.length;
-  $('stat-models').textContent = s.models.length;
-  $('stat-logs').textContent = s.logs.length;
-  $('keys-body').innerHTML = s.keys.map(k =>
-    `<tr><td>${k.id}</td><td>${esc(k.label)}</td><td><code>${esc(k.key)}</code></td><td>${esc(k.created_at||'')}</td><td><button onclick="delKey('${k.id}')">Sil</button></td></tr>`).join('');
+  $('status').textContent = s.router_auth_required ? 'router auth: ON' : 'router auth: OFF (local)';
+  const st = s.stats || {};
+  $('d-total').textContent = fmt(st.total_requests);
+  $('d-ok').textContent = fmt(st.ok);
+  $('d-err').textContent = fmt(st.err);
+  $('d-rate').textContent = '%' + (st.success_rate ?? 0);
+  $('d-in').textContent = fmt(st.input_tokens);
+  $('d-out').textContent = fmt(st.output_tokens);
+  $('d-tot').textContent = fmt(st.total_tokens);
+  $('d-lat').textContent = st.avg_latency_ms ?? 0;
+  const row = (k,v) => `<tr><td><code>${esc(k)}</code></td><td>${fmt(v.requests)}</td><td>${fmt(v.ok)}</td><td>${fmt(v.err)}</td><td>${fmt(v.input_tokens)}</td><td>${fmt(v.output_tokens)}</td></tr>`;
+  $('d-by-model').innerHTML = Object.entries(st.by_model||{}).map(([k,v]) => row(k,v)).join('') || '<tr><td colspan="6" class="hint">no data yet</td></tr>';
+  $('d-by-key').innerHTML = Object.entries(st.by_key||{}).map(([k,v]) => row(k,v)).join('') || '<tr><td colspan="6" class="hint">no data yet</td></tr>';
+  $('d-by-endpoint').innerHTML = Object.entries(st.by_endpoint||{}).map(([k,v]) => row(k,v)).join('') || '<tr><td colspan="6" class="hint">no data yet</td></tr>';
+  $('d-by-provider').innerHTML = Object.entries(st.by_provider||{}).map(([k,v]) => row(k,v)).join('') || '<tr><td colspan="6" class="hint">no data yet</td></tr>';
+  $('d-thinking').textContent = st.thinking_requests ? `· 🧠 thinking requests: ${fmt(st.thinking_requests)}` : '';
+  renderProviderSelect(s.providers || []);
+  const days = Object.entries(st.by_day||{}).sort().slice(-14);
+  const maxReq = Math.max(1, ...days.map(([,v]) => v.requests));
+  $('d-by-day').innerHTML = days.map(([k,v]) => {
+    const w = Math.round(100 * v.requests / maxReq);
+    return `<tr><td><code>${esc(k)}</code></td><td>${fmt(v.requests)}</td><td>${fmt(v.ok)}</td><td>${fmt(v.err)}</td><td>${fmt(v.input_tokens+v.output_tokens)}</td><td><div class="bar"><div style="width:${w}%"></div></div></td></tr>`;
+  }).join('') || '<tr><td colspan="6" class="hint">no data yet</td></tr>';
+  $('rk-body').innerHTML = (s.router_keys||[]).map(k =>
+    `<tr><td>${esc(k.label)}</td><td><code>${esc(k.masked||k.prefix||'')}</code></td><td>${esc(k.created_at||'')}</td><td>${esc(k.last_used_at||'-')}</td><td>${fmt(k.request_count)}</td><td><button class="danger" onclick="delRouterKey('${k.id}')">Revoke</button></td></tr>`).join('')
+    || '<tr><td colspan="6" class="hint">no user keys yet — generate one above</td></tr>';
+  $('keys-body').innerHTML = (s.provider_keys||[]).map(k =>
+    `<tr><td>${esc(k.label)}</td><td><code>${esc(k.provider)}</code></td><td><code>${esc(k.protocol)}</code></td><td><small>${esc(shortBase(k.effective_base||k.base_url||''))}</small></td><td><code>${esc(k.key)}</code></td><td>${esc((k.created_at||'').slice(0,19).replace('T',' '))}</td><td><button onclick="delKey('${k.id}')">Delete</button></td></tr>`).join('')
+    || '<tr><td colspan="7" class="hint">no provider keys yet</td></tr>';
   $('models-body').innerHTML = s.models.map(m =>
-    `<tr><td><code>${esc(m.name)}</code></td><td>${esc(m.gemini_model)}</td><td>${esc(m.description||'')}</td><td><button onclick="delModel('${esc(m.name)}')">Sil</button></td></tr>`).join('');
+    `<tr><td><code>${esc(m.name)}</code></td><td><code>${esc(m.provider||'gemini')}</code></td><td>${esc(m.upstream_model||m.gemini_model||'')}</td><td>${esc(m.description||'')}</td><td><button onclick="delModel('${esc(m.name)}')">Delete</button></td></tr>`).join('');
   $('logs-body').innerHTML = s.logs.map(l =>
-    `<tr><td>${esc(l.ts||'')}</td><td>${esc(l.endpoint||'')}</td><td>${esc(l.model||'')}</td><td>${l.ok?'✅':'❌'}</td><td>${l.latency_ms??''}</td><td>${esc(l.error||'')}</td></tr>`).join('');
+    `<tr><td>${esc((l.ts||'').slice(0,19).replace('T',' '))}</td><td>${esc(l.endpoint||'')}</td><td>${esc(l.model||'')}</td><td>${esc(l.provider||'-')}</td><td>${esc(l.api_key_label||'-')}</td><td>${l.ok?'✅':'❌'}</td><td>${l.latency_ms??''}</td><td>${fmt(l.input_tokens)}</td><td>${fmt(l.output_tokens)}</td><td>${l.thinking?'🧠':''}</td><td>${esc(l.error||'')}</td></tr>`).join('');
+  if (s.settings && $('default-system')) $('default-system').value = s.settings.default_system || '';
 }
 function esc(s){ return String(s??'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-async function addKey(quick) {
-  const key = $(quick?'quick-key':'key-value').value.trim();
-  const label = $(quick?'quick-label':'key-label').value.trim();
-  if (!key) return alert('key gir');
-  const r = await fetch('/admin/api/keys', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key, label})});
-  if (!r.ok) return alert('hata: ' + await r.text());
-  $(quick?'quick-key':'key-value').value=''; refresh();
+function shortBase(u){ u = String(u||''); try { const x = new URL(u); return x.host + (x.pathname.length > 1 ? x.pathname : ''); } catch(e){ return u.slice(0, 40); } }
+let PROVIDERS = [];
+function renderProviderSelect(providers) {
+  PROVIDERS = providers;
+  const sel = $('key-provider');
+  if (!sel.options.length) {
+    providers.forEach(p => {
+      const o = document.createElement('option');
+      o.value = p.id; o.textContent = p.id;
+      sel.appendChild(o);
+    });
+    sel.value = 'gemini';
+    sel.onchange = updateKeyHint;
+    $('key-protocol').onchange = updateKeyHint;
+  }
+  updateKeyHint();
 }
-async function delKey(id){ await fetch('/admin/api/keys/'+id, {method:'DELETE'}); refresh(); }
+function provOf(id){ return PROVIDERS.find(p => p.id === id) || {}; }
+function updateKeyHint() {
+  const p = provOf($('key-provider').value);
+  const proto = $('key-protocol').value || p.protocol || '';
+  $('key-base').placeholder = 'base URL (empty = ' + (p.base_url || 'none') + ')';
+  $('key-value').placeholder = p.key_hint ? ('API key (' + p.key_hint + ')') : 'API key';
+  $('key-default-hint').textContent =
+    'Selected: provider=' + ($('key-provider').value||'?') +
+    ' → protocol=' + (proto||'?') +
+    ' → address=' + ($('key-base').value.trim() || p.base_url || '(required for custom)');
+}
+async function addKey() {
+  const key = $('key-value').value.trim();
+  const label = $('key-label').value.trim();
+  const provider = $('key-provider').value;
+  const protocol = $('key-protocol').value || null;
+  const base_url = $('key-base').value.trim();
+  if (!key) return alert('enter a key');
+  const r = await fetch('/admin/api/provider-keys', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key, label, provider, protocol, base_url})});
+  if (!r.ok) return alert('error: ' + await r.text());
+  $('key-value').value=''; $('key-base').value=''; refresh();
+}
+async function delKey(id){ await fetch('/admin/api/provider-keys/'+id, {method:'DELETE'}); refresh(); }
 async function addModel() {
-  const name = $('model-name').value.trim(), gemini_model = $('model-gemini').value.trim() || 'gemini-2.0-flash', description = $('model-desc').value.trim();
-  if (!name) return alert('model adı gir');
-  const r = await fetch('/admin/api/models', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name, gemini_model, description})});
-  if (!r.ok) return alert('hata: ' + await r.text());
-  refresh();
+  const name = $('model-name').value.trim(),
+        provider = $('model-provider').value,
+        upstream_model = $('model-upstream').value.trim(),
+        description = $('model-desc').value.trim();
+  if (!name) return alert('enter a model name');
+  if (!upstream_model) return alert('enter an upstream model (e.g.: gpt-4o-mini)');
+  const r = await fetch('/admin/api/models', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name, provider, upstream_model, description})});
+  if (!r.ok) return alert('error: ' + await r.text());
+  $('model-name').value=''; $('model-upstream').value=''; refresh();
 }
 async function delModel(n){ await fetch('/admin/api/models/'+encodeURIComponent(n), {method:'DELETE'}); refresh(); }
+async function saveSettings(){
+  const default_system = $('default-system').value;
+  const r = await fetch('/admin/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({default_system})});
+  if (!r.ok) return alert('error: ' + await r.text());
+  alert('saved'); refresh();
+}
+async function addClaudeAlias(){
+  const name = $('alias-claude').value.trim();
+  if (!name) return alert('enter an alias (e.g.: claude-sonnet-4-5)');
+  const provider = $('alias-provider').value;
+  let upstream_model = $('alias-upstream').value.trim() || name;
+  const r = await fetch('/admin/api/models', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name, provider, upstream_model, description: 'Claude Code alias'})});
+  if (!r.ok) return alert('error: ' + await r.text());
+  $('alias-claude').value=''; $('alias-upstream').value=''; refresh();
+}
+async function addRouterKey(){
+  const label = $('rk-label').value.trim() || 'user';
+  const r = await fetch('/admin/api/router-keys', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({label})});
+  if (!r.ok) return alert('error: ' + await r.text());
+  const j = await r.json();
+  $('rk-new-value').textContent = j.key;
+  $('rk-new').classList.remove('hidden');
+  $('rk-label').value='';
+  refresh();
+}
+async function delRouterKey(id){
+  if (!confirm('Revoke this key? Clients using it will get 401.')) return;
+  await fetch('/admin/api/router-keys/'+id, {method:'DELETE'}); refresh();
+}
+function copyNewKey(){
+  const t = $('rk-new-value').textContent;
+  navigator.clipboard?.writeText(t).then(() => alert('copied')).catch(() => prompt('Copy:', t));
+}
+async function resetStats(){
+  if (!confirm('Delete all statistics and recent request logs?')) return;
+  await fetch('/admin/api/stats', {method:'DELETE'}); refresh();
+}
 refresh();
 </script>
 </body>
