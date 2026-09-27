@@ -1035,9 +1035,13 @@ def openai_to_anthropic_body(oai_body, default_system: str = "") -> tuple[dict, 
 def anthropic_to_openai_body(anth_body, default_system: str = "") -> tuple[dict, str | None]:
     """Anthropic messages body -> (OpenAI chat body, reasoning_effort|None).
 
-    tool_use -> tool_calls (id preserved), tool_result -> tool message,
+    tool_use -> tool_calls (id preserved), tool_result -> tool message
+    (empty tool_use_id falls back to user text, empty result gets a placeholder),
     thinking block cannot be carried to upstream OpenAI -> dropped (documented),
     thinking parameter -> reasoning_effort heuristic.
+    When thinking is on, temperature/top_p are dropped: OpenAI reasoning
+    models (o1/o3/gpt-5 etc.) and strict gateways reject non-default values
+    with 400 invalid_request_error.
     """
     anth_body = anth_body or {}
     system_text = _merge_anthropic_system(default_system, anth_body.get("system"))
@@ -1094,10 +1098,17 @@ def anthropic_to_openai_body(anth_body, default_system: str = "") -> tuple[dict,
                                "function": {"name": str(b.get("name", "tool")),
                                             "arguments": json.dumps(args, ensure_ascii=False)}})
             elif btype == "tool_result":
-                tid = str(b.get("tool_use_id", ""))
+                tid = str(b.get("tool_use_id", "") or "").strip()
                 txt = _extract_text_from_anthropic_content(b.get("content"))
                 if b.get("is_error") and txt:
                     txt = f"Error: {txt}"
+                if not txt:
+                    txt = "(empty tool result)"
+                if not tid:
+                    # OpenAI rejects tool messages with empty tool_call_id (400).
+                    # Fall back to plain user text so the request stays valid.
+                    texts.append(f"[tool_result]: {txt}")
+                    continue
                 tresults.append({"role": "tool", "tool_call_id": tid, "content": txt})
             elif btype in ("thinking", "redacted_thinking"):
                 continue  # no equivalent in OpenAI chat input
@@ -1123,7 +1134,9 @@ def anthropic_to_openai_body(anth_body, default_system: str = "") -> tuple[dict,
             if tcalls and role == "assistant":
                 m["tool_calls"] = tcalls
                 if not texts and not images:
-                    m["content"] = ""
+                    # OpenAI-compatible gateways (vLLM, Ollama, opencode zen)
+                    # reject content:"" with tool_calls; null is the valid form.
+                    m["content"] = None
             elif tcalls:
                 # tool_use must not appear inside user; reduce to plain text (name preserved)
                 for tc in tcalls:
@@ -1138,9 +1151,22 @@ def anthropic_to_openai_body(anth_body, default_system: str = "") -> tuple[dict,
         obody["max_tokens"] = int(anth_body.get("max_tokens") or 1024)
     except (TypeError, ValueError):
         obody["max_tokens"] = 1024
-    for k in ("temperature", "top_p"):
-        if anth_body.get(k) is not None:
-            obody[k] = anth_body[k]
+    # Clamp absurd max_tokens (Claude Code can send very large values with
+    # thinking budgets); strict upstreams return 400 when it exceeds the
+    # model's max output window.
+    try:
+        if int(obody["max_tokens"]) > 16384:
+            obody["max_tokens"] = 16384
+    except (TypeError, ValueError):
+        pass
+    reasoning_effort = None
+    thinking_on, _budget = anthropic_thinking_of_body(anth_body)
+    if not thinking_on:
+        for k in ("temperature", "top_p"):
+            if anth_body.get(k) is not None:
+                obody[k] = anth_body[k]
+    # NOTE: when thinking is on, temperature/top_p are intentionally dropped
+    # (see docstring).
     stop = anth_body.get("stop_sequences")
     if isinstance(stop, str):
         stop = [stop]
@@ -1169,12 +1195,69 @@ def anthropic_to_openai_body(anth_body, default_system: str = "") -> tuple[dict,
         elif ctype == "tool" and choice.get("name"):
             obody["tool_choice"] = {"type": "function",
                                     "function": {"name": str(choice["name"])}}
-    reasoning_effort = None
-    thinking_on, budget = anthropic_thinking_of_body(anth_body)
     if thinking_on:
-        reasoning_effort = effort_for_budget(budget if budget else 4096)
+        _b = _budget if _budget else 4096
+        reasoning_effort = effort_for_budget(_b)
         obody["reasoning_effort"] = reasoning_effort
     return obody, reasoning_effort
+
+
+def sanitize_openai_body_for_retry(obody: dict) -> tuple[dict, list[str]]:
+    """Strip params that strict OpenAI-compatible gateways reject (pure).
+
+    Returns (sanitized_body, removed_keys). Removes reasoning_effort,
+    temperature/top_p (rejected together with reasoning), converts
+    max_tokens -> max_completion_tokens (o1/o3/zen style gateways), drops
+    empty tool_choice/stop. Used for a one-time retry after a 400.
+    """
+    body = json.loads(json.dumps(obody or {})) if isinstance(obody, dict) else {}
+    removed: list[str] = []
+    for k in ("reasoning_effort", "reasoning", "temperature", "top_p"):
+        if k in body:
+            body.pop(k, None)
+            removed.append(k)
+    if "max_tokens" in body and "max_completion_tokens" not in body:
+        try:
+            body["max_completion_tokens"] = int(body.pop("max_tokens"))
+            removed.append("max_tokens->max_completion_tokens")
+        except (TypeError, ValueError):
+            body.pop("max_tokens", None)
+            removed.append("max_tokens")
+    # fix assistant content "" + tool_calls (some gateways require null)
+    try:
+        for m in body.get("messages", []) or []:
+            if isinstance(m, dict) and m.get("tool_calls") and m.get("content") == "":
+                m["content"] = None
+                if "content_fixed" not in removed:
+                    removed.append("content_fixed")
+            if isinstance(m, dict) and m.get("role") == "tool":
+                if not str(m.get("tool_call_id", "") or "").strip():
+                    m["role"] = "user"
+                    m.pop("tool_call_id", None)
+                    m["content"] = f"[tool_result]: {m.get('content') or '(empty)'}"
+                    if "tool_call_id_fixed" not in removed:
+                        removed.append("tool_call_id_fixed")
+                elif not str(m.get("content", "") or "").strip():
+                    m["content"] = "(empty tool result)"
+    except (AttributeError, TypeError):
+        pass
+    return body, removed
+
+
+def describe_openai_body(obody: dict) -> str:
+    """One-line payload summary for error logs (no message content)."""
+    try:
+        msgs = obody.get("messages", []) if isinstance(obody, dict) else []
+        n = len(msgs) if isinstance(msgs, list) else 0
+        roles = ""
+        try:
+            roles = ",".join(str(m.get("role", "?"))[:5] for m in msgs[:8]) if isinstance(msgs, list) else ""
+        except (AttributeError, TypeError):
+            pass
+        keys = sorted(k for k in (obody or {}) if k != "messages")
+        return f"msgs={n} [{roles}] keys={keys} max={obody.get('max_tokens', obody.get('max_completion_tokens', '?'))}"
+    except Exception:
+        return "?"
 
 
 def openai_response_to_anthropic(oai: dict, router_model: str) -> dict:
@@ -1998,7 +2081,7 @@ def add_log(endpoint: str, model: str, ok: bool, latency_ms: int, error: str = "
         logs = data.get("logs", [])
         logs.append(
             {"ts": _now_iso(), "endpoint": endpoint, "model": model,
-             "ok": ok, "latency_ms": latency_ms, "error": (error or "")[:300],
+             "ok": ok, "latency_ms": latency_ms, "error": (error or "")[:2000],
              "input_tokens": input_tokens, "output_tokens": output_tokens,
              "total_tokens": input_tokens + output_tokens,
              "api_key_id": api_key_id or "", "api_key_label": api_key_label or "",
@@ -2080,22 +2163,49 @@ def create_app() -> Flask:
         return {"anthropic-beta": beta.strip()} if beta.strip() else {}
 
     def _cross_error_message(protocol: str, resp) -> str:
-        """Reduce an upstream error in a cross-protocol call to plain text."""
+        """Reduce an upstream error in a cross-protocol call to plain text.
+
+        Keeps type/code/param details (not just message) + HTTP status, so
+        generic errors like "invalid request" stay diagnosable in /admin logs.
+        """
+        status = getattr(resp, "status_code", "?")
         try:
             bj = resp.json()
         except (ValueError, TypeError):
             bj = None
+        detail = ""
         if isinstance(bj, dict):
-            if protocol == "anthropic":
-                e = bj.get("error", {})
-                if isinstance(e, dict) and e.get("message"):
-                    return str(e["message"])[:500]
             err = bj.get("error")
-            if isinstance(err, dict) and err.get("message"):
-                return str(err["message"])[:500]
-            if isinstance(err, str) and err:
-                return err[:500]
-        return ((resp.text or "")[:500]) or f"upstream {resp.status_code}"
+            if isinstance(err, dict):
+                parts = []
+                for k in ("type", "code", "param", "message"):
+                    v = err.get(k)
+                    if v:
+                        parts.append(f"{k}={v}")
+                if parts:
+                    detail = " ".join(str(p) for p in parts)
+            elif isinstance(err, str) and err.strip():
+                detail = err.strip()
+            if not detail:
+                # e.g. Anthropic {"type":"error","error":{...}} or zen wrappers
+                for k in ("message", "detail"):
+                    v = bj.get(k)
+                    if isinstance(v, str) and v.strip():
+                        detail = v.strip()
+                        break
+            if not detail:
+                try:
+                    detail = json.dumps(bj, ensure_ascii=False)[:1000]
+                except (TypeError, ValueError):
+                    detail = ""
+        if not detail:
+            try:
+                detail = (resp.text or "").strip()[:1000]
+            except Exception:
+                detail = ""
+        if not detail:
+            detail = f"upstream {status}"
+        return f"Upstream {status}: {detail}"[:2000]
 
     @app.get("/")
     def index():
@@ -2391,6 +2501,18 @@ def create_app() -> Flask:
                 _entry, resp = call_upstream(
                     "openai", up_body, stream=stream,
                     timeout=STREAM_TIMEOUT if stream else 60)
+                if resp.status_code == 400 and not stream:
+                    retry_body, removed = sanitize_openai_body_for_retry(up_body)
+                    if removed:
+                        _close_quietly(resp)
+                        _entry2, resp2 = call_upstream(
+                            "openai", retry_body, stream=False, timeout=60)
+                        if resp2.status_code == 200:
+                            resp = resp2
+                            _entry = _entry2
+                        else:
+                            _close_quietly(resp)
+                            resp = resp2
                 if resp.status_code != 200:
                     add_log(ep, router_model, False, int((time.time() - t0) * 1000),
                             _cross_error_message("openai", resp),
@@ -2552,13 +2674,39 @@ def create_app() -> Flask:
                 obody["model"] = upstream
                 # upstream OpenAI SSE cannot be converted to Anthropic SSE; buffer it
                 _entry, resp = call_upstream("openai", obody, stream=False, timeout=60)
+                if resp.status_code == 400:
+                    # Strict gateways (opencode zen, Ollama, vLLM) reject
+                    # reasoning_effort / temperature / max_tokens variants with
+                    # a generic 400. Retry once with a sanitized payload.
+                    retry_body, removed = sanitize_openai_body_for_retry(obody)
+                    if removed:
+                        _close_quietly(resp)
+                        _entry2, resp2 = call_upstream(
+                            "openai", retry_body, stream=False, timeout=60)
+                        if resp2.status_code == 200:
+                            resp = resp2
+                            _entry = _entry2
+                        else:
+                            first_err = _cross_error_message("openai", resp)
+                            _close_quietly(resp)
+                            resp = resp2
+                            second_err = _cross_error_message("openai", resp)
+                            hint = (f"retry without {removed} also failed. "
+                                    f"payload=({describe_openai_body(obody)})")
+                            msg = f"{second_err} [first: {first_err[:300]}] [{hint}]"
+                            add_log(ep, router_model, False, int((time.time() - t0) * 1000),
+                                    msg, 0, 0, kid, klabel, provider, thinking)
+                            return jsonify({"type": "error", "error": {
+                                "type": "api_error", "message": msg}}), resp.status_code
                 if resp.status_code != 200:
+                    msg = (_cross_error_message("openai", resp)
+                           + f" [payload=({describe_openai_body(obody)})]")
                     add_log(ep, router_model, False, int((time.time() - t0) * 1000),
-                            _cross_error_message("openai", resp),
+                            msg,
                             0, 0, kid, klabel, provider, thinking)
                     return jsonify({"type": "error", "error": {
                         "type": "api_error",
-                        "message": _cross_error_message("openai", resp)}}), resp.status_code
+                        "message": msg}}), resp.status_code
                 anth = openai_response_to_anthropic(resp.json(), router_model)
                 thinking = thinking or any(
                     isinstance(b, dict) and b.get("type") == "thinking"
