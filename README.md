@@ -174,4 +174,15 @@ Tests do not send real requests to Gemini (`requests.post` is mocked).
   walks `chat → responses → messages` whenever upstream answers `ModelProtocolUnsupported`.
   System One models (`jev-*`) take `{state, questions}` and are refused on `/v1/chat/completions`
   with an explicit error rather than an opaque upstream 400.
+- **Rate-limit cooldown.** A key that answers 429 is parked for 5 minutes and skipped by the
+  pool; the next request rotates to another key. When an explicit `Retry-After` (or
+  `retry-after-ms`, or the HTTP-date form) is present it wins over the 5-minute floor, capped at
+  24h — OpenCode's daily free quota resets at 00:00 UTC and reports ~19h, so a flat 5 minutes
+  would just re-hammer it. `X-Samet-Router: all-keys-cooling` keys are listed on the provider page.
+- **Stale-response fallback.** While every key for a target is cooling, the router replays the last
+  good non-streaming response for that provider+model instead of failing the client. This is a
+  liveness shim, **not a cache**: the payload answers an earlier prompt, not the current one. It
+  is always flagged — `X-Samet-Router: stale-response` and a `samet_router` block in the body with
+  the original timestamp, age and `retry_after`. With nothing cached the router returns an honest
+  429 carrying `Retry-After`.
 - This is a hobby/startup prototype; add auth + rate limiting + DB for production.

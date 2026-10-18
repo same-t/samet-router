@@ -1,6 +1,7 @@
 """Samet Router tests - no network access, requests.post is mocked."""
 import json
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -512,21 +513,26 @@ def test_openai_to_openai_passthrough(tmp_path, monkeypatch):
 
 
 def test_openai_upstream_error_forwarded(tmp_path, monkeypatch):
+    """Non-429 upstream errors are still relayed verbatim.
+
+    429 is deliberately different: it parks the key and, once no key is usable,
+    the handler replays a cached response instead (see the cooldown tests).
+    """
     c = make_client(tmp_path)
     _add_openai_upstream(c)
 
     class R:
-        status_code = 429
-        text = '{"error": {"message": "hiz limiti"}}'
+        status_code = 500
+        text = '{"error": {"message": "upstream is down"}}'
 
         def json(self):
-            return {"error": {"message": "hiz limiti"}}
+            return {"error": {"message": "upstream is down"}}
 
     monkeypatch.setattr(router.requests, "post", lambda *a, **k: R())
     r = c.post("/v1/chat/completions", json={
         "model": "samet-oai", "messages": [{"role": "user", "content": "hi"}]})
-    assert r.status_code == 429
-    assert "hiz limiti" in r.text
+    assert r.status_code == 500
+    assert "upstream is down" in r.text
 
 
 def test_custom_base_url_used(tmp_path, monkeypatch):
@@ -1646,6 +1652,266 @@ def test_systemone_model_refused_with_clear_error(tmp_path):
     err = r.get_json()["error"]
     assert err["code"] == "systemone_model"
     assert "systemone" in err["message"]
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit cooldown + stale-response fallback
+# ---------------------------------------------------------------------------
+
+
+def _reset_circuit():
+    router._cooldowns.clear()
+    router._response_cache.clear()
+
+
+def test_first_429_with_single_key_falls_to_cache(tmp_path, monkeypatch):
+    """With one key, the 429 that parks it must not reach the client as a bare 429."""
+    c = make_client(tmp_path)
+    _reset_circuit()
+    c.post("/admin/api/provider-keys", json={"key": "sk-a", "provider": "openai"})
+    c.post("/admin/api/models", json={"name": "m", "provider": "openai",
+                                     "upstream_model": "gpt-x"})
+
+    class R200:
+        status_code = 200
+        text = "ok"
+        headers = {}
+
+        def json(self):
+            return fake_openai_chat("cached-answer")
+
+    class R429:
+        status_code = 429
+        text = "slow"
+        headers = {}
+
+        def json(self):
+            return {"error": {"message": "Rate limit exceeded"}}
+
+    monkeypatch.setattr(router.requests, "post", lambda url, **kw: R200())
+    assert c.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "a"}]}).status_code == 200
+
+    monkeypatch.setattr(router.requests, "post", lambda url, **kw: R429())
+    r = c.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "b"}]})
+    assert r.status_code == 200, r.text
+    j = r.get_json()
+    assert j["choices"][0]["message"]["content"] == "cached-answer"
+    assert j["samet_router"]["stale"] is True
+    assert r.headers["X-Samet-Router"] == "stale-response"
+
+
+def test_retry_after_parsing(tmp_path):
+    class R:
+        def __init__(self, h):
+            self.headers = h
+
+    assert router.retry_after_seconds(R({"retry-after": "30"})) == 30
+    assert router.retry_after_seconds(R({"Retry-After": "12.5"})) == 12.5
+    assert router.retry_after_seconds(R({"retry-after-ms": "4500"})) == 4.5
+    # http-date form
+    import email.utils as eu
+    when = eu.formatdate(time.time() + 60, usegmt=True)
+    got = router.retry_after_seconds(R({"retry-after": when}))
+    assert got is not None and 55 <= got <= 62, got
+    # junk / missing -> None, so the default cooldown applies
+    assert router.retry_after_seconds(R({"retry-after": "soon"})) is None
+    assert router.retry_after_seconds(R({})) is None
+    assert router.retry_after_seconds(object()) is None
+
+
+def test_cooldown_marking_and_expiry(tmp_path):
+    _reset_circuit()
+    entry = {"id": "k1", "key": "sk-1"}
+    assert not router.key_is_cooling(entry)
+    applied = router.mark_key_cooling(entry)
+    assert 299 <= applied <= 301, applied
+    assert router.key_is_cooling(entry)
+    assert 295 <= router.key_cooldown_remaining(entry) <= 301
+    # a shorter upstream Retry-After must not shorten the floor
+    assert router.mark_key_cooling(entry, 5) >= 300
+    # an absurd one is capped
+    assert router.mark_key_cooling(entry, 999999) == router.RATE_LIMIT_COOLDOWN_MAX
+    # expiry
+    router._cooldowns["k1"] = time.time() - 1
+    assert not router.key_is_cooling(entry)
+    router.prune_cooldowns()
+    assert "k1" not in router._cooldowns
+
+
+def test_cooling_keys_are_skipped_from_the_pool(tmp_path):
+    c = make_client(tmp_path)
+    _reset_circuit()
+    assert c.post("/admin/api/provider-keys", json={
+        "key": "sk-a", "label": "a", "provider": "openai"}).status_code == 201
+    assert c.post("/admin/api/provider-keys", json={
+        "key": "sk-b", "label": "b", "provider": "openai"}).status_code == 201
+    data = router.load_data()
+    entries = [k for k in data["provider_keys"] if k["provider"] == "openai"]
+    assert len(router._ordered_pool(data, "openai", "openai")) == 2
+
+    router.mark_key_cooling(entries[0])
+    pool = router._ordered_pool(data, "openai", "openai")
+    assert len(pool) == 1
+    assert pool[0]["id"] == entries[1]["id"]
+
+
+def test_all_keys_cooling_raises_and_reports_wait(tmp_path):
+    c = make_client(tmp_path)
+    _reset_circuit()
+    c.post("/admin/api/provider-keys", json={
+        "key": "sk-a", "provider": "openai"})
+    data = router.load_data()
+    entry = [k for k in data["provider_keys"] if k["provider"] == "openai"][0]
+    router.mark_key_cooling(entry, 600)
+    with pytest.raises(router.AllKeysCoolingDown) as exc:
+        router._ordered_pool(data, "openai", "openai")
+    assert exc.value.keys == 1
+    assert 500 <= exc.value.retry_after <= 601
+
+
+def test_429_parks_the_key_and_next_request_skips_it(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    _reset_circuit()
+    c.post("/admin/api/provider-keys", json={"key": "sk-a", "label": "a",
+                                            "provider": "openai"})
+    c.post("/admin/api/provider-keys", json={"key": "sk-b", "label": "b",
+                                            "provider": "openai"})
+    c.post("/admin/api/models", json={"name": "m", "provider": "openai",
+                                     "upstream_model": "gpt-x"})
+
+    class R429:
+        status_code = 429
+        text = "slow down"
+        headers = {"retry-after": "900"}
+        reason = "rate limited"
+
+        def json(self):
+            return {"error": {"message": "Rate limit exceeded"}}
+
+    class R200:
+        status_code = 200
+        text = "ok"
+        headers = {}
+
+        def json(self):
+            return fake_openai_chat("second")
+
+    seq = [R429(), R200()]
+
+    def fake_post(url, **kw):
+        return seq.pop(0)
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    r = c.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    # first key 429s, the router rotates to the second key and succeeds
+    assert r.status_code == 200, r.text
+    assert r.get_json()["choices"][0]["message"]["content"] == "second"
+    # Retry-After 900s beat the 5-minute floor
+    parked = [k for k in router.load_data()["provider_keys"]
+              if k["provider"] == "openai" and router.key_is_cooling(k)]
+    assert len(parked) == 1
+    assert router.key_cooldown_remaining(parked[0]) > 890
+    # the healthy key is still usable
+    healthy = [k for k in router.load_data()["provider_keys"]
+               if k["provider"] == "openai" and not router.key_is_cooling(k)]
+    assert len(healthy) == 1
+
+
+def test_all_cooling_serves_cached_response(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    _reset_circuit()
+    c.post("/admin/api/provider-keys", json={"key": "sk-a", "provider": "openai"})
+    c.post("/admin/api/models", json={"name": "m", "provider": "openai",
+                                     "upstream_model": "gpt-x"})
+
+    class R200:
+        status_code = 200
+        text = "ok"
+        headers = {}
+
+        def json(self):
+            return fake_openai_chat("the-real-answer")
+
+    monkeypatch.setattr(router.requests, "post", lambda url, **kw: R200())
+    first = c.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    assert first.status_code == 200
+    assert first.get_json()["choices"][0]["message"]["content"] == "the-real-answer"
+
+    # park the only key; the next request must not reach upstream at all
+    entry = [k for k in router.load_data()["provider_keys"]
+             if k["provider"] == "openai"][0]
+    router.mark_key_cooling(entry)
+
+    def boom(*a, **k):
+        raise AssertionError("upstream must not be called while cooling")
+
+    monkeypatch.setattr(router.requests, "post", boom)
+    second = c.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "different question"}]})
+    assert second.status_code == 200
+    j = second.get_json()
+    # stale payload replayed, and clearly labelled as such
+    assert j["choices"][0]["message"]["content"] == "the-real-answer"
+    assert j["model"] == "m"
+    assert j["samet_router"]["stale"] is True
+    assert second.headers["X-Samet-Router"] == "stale-response"
+    assert int(second.headers["Retry-After"]) > 0
+
+
+def test_all_cooling_without_cache_returns_429(tmp_path):
+    c = make_client(tmp_path)
+    _reset_circuit()
+    c.post("/admin/api/provider-keys", json={"key": "sk-a", "provider": "openai"})
+    c.post("/admin/api/models", json={"name": "m", "provider": "openai",
+                                     "upstream_model": "gpt-x"})
+    entry = [k for k in router.load_data()["provider_keys"]
+             if k["provider"] == "openai"][0]
+    router.mark_key_cooling(entry)
+    r = c.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 429
+    assert r.get_json()["error"]["type"] == "rate_limit_error"
+    assert int(r.headers["Retry-After"]) > 0
+    assert r.headers["X-Samet-Router"] == "all-keys-cooling"
+
+
+def test_cache_is_scoped_per_provider_and_model(tmp_path):
+    _reset_circuit()
+    payload = {"id": "x", "choices": [{"message": {"content": "hi"}}]}
+    router.cache_store_response("openai", "gpt-x", payload)
+    assert router.cache_get_response("openai", "gpt-x")["json"] == payload
+    assert router.cache_get_response("openai", "gpt-y") is None
+    assert router.cache_get_response("commandcode", "gpt-x") is None
+    # aged out
+    router._response_cache[("openai", "gpt-x")]["at"] = \
+        time.time() - router.CACHE_MAX_AGE - 1
+    assert router.cache_get_response("openai", "gpt-x") is None
+
+
+def test_cache_is_bounded(tmp_path):
+    _reset_circuit()
+    for i in range(router.CACHE_MAX_ENTRIES + 15):
+        router.cache_store_response("openai", "m%d" % i, {"id": str(i)})
+    assert len(router._response_cache) <= router.CACHE_MAX_ENTRIES
+
+
+def test_cooling_shown_in_provider_detail(tmp_path):
+    c = make_client(tmp_path)
+    _reset_circuit()
+    c.post("/admin/api/provider-keys", json={
+        "key": "sk-a", "label": "a", "provider": "openai"})
+    assert c.get("/admin/api/providers/openai").get_json()["cooling"] == []
+    entry = [k for k in router.load_data()["provider_keys"]
+             if k["provider"] == "openai"][0]
+    router.mark_key_cooling(entry, 900)
+    cooling = c.get("/admin/api/providers/openai").get_json()["cooling"]
+    assert len(cooling) == 1
+    assert cooling[0]["label"] == "a"
+    assert cooling[0]["retry_after"] > 800
 
 
 def test_aggregate_openai_sse_builds_json():

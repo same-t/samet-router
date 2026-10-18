@@ -249,7 +249,7 @@ async function load() {
   $('pd-headers-badge').classList.toggle('hidden',
     !(d.settings.headers_active && (d.settings.custom_headers || []).length));
 
-  renderConnections(d.connections || []);
+  renderConnections(d.connections || [], d.cooling || []);
   renderModels(d.models || [], d.short, d.id);
   renderSuggestions(d.suggestions || []);
   document.querySelector('.pd-suggest-title').textContent = pdSuggestTitle(d.id);
@@ -261,7 +261,8 @@ async function load() {
   } catch (e) {}
 }
 
-function renderConnections(conns) {
+function renderConnections(conns, cooling) {
+  const cool = new Map((cooling || []).map(c => [c.id, c.retry_after]));
   if (!conns.length) {
     $('conn-left').innerHTML = `<div class="conn-empty"><span class="conn-lock">${PD_LOCK}</span> No connections yet</div>`;
     return;
@@ -270,18 +271,31 @@ function renderConnections(conns) {
     const isOauth = k.auth_type === 'oauth';
     const acct = k.account || {};
     const sub = isOauth ? (acct.email || acct.org_name || '') : '';
+    const left = cool.get(k.id);
+    const mins = left ? Math.ceil(left / 60) : 0;
+    const badge = left
+      ? `<span class="tag" title="rate limited: skipped until the cooldown ends"
+             style="background:var(--warn-a,rgba(245,165,36,.14));border-color:rgba(245,165,36,.4);color:#f5a524"
+             >cooling ~${mins}m</span>`
+      : '';
     return `
     <div class="conn-item">
-      <span class="conn-dot"></span>
+      <span class="conn-dot"${left ? ' style="background:#f5a524"' : ''}></span>
       <span class="conn-label">${esc(k.label)}</span>
       ${isOauth
         ? '<span class="badge-soft">account</span>'
         : `<code class="conn-key">${esc(k.key)}</code>`}
+      ${badge}
       ${sub ? `<span class="conn-meta">${esc(sub)}</span>` : ''}
       <span class="conn-meta">prio ${k.priority ?? 1}</span>
       <button class="conn-del" onclick="delConnection('${k.id}')">Delete</button>
     </div>`;
   }).join('');
+  if (cool.size) {
+    $('conn-left').innerHTML += `<p class="hint" style="margin-top:4px">${cool.size} key(s)
+      rate limited and being skipped. When every key is cooling, the router replays
+      the last good response for this provider instead of failing.</p>`;
+  }
 }
 async function delConnection(id) {
   await fetch('/admin/api/provider-keys/' + id, { method: 'DELETE' });

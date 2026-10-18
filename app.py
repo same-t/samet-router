@@ -373,6 +373,173 @@ def _normalize_data(data: dict) -> dict:
     return data
 
 
+# ---------------------------------------------------------------------------
+# Rate-limit cooldown + stale-response fallback
+# ---------------------------------------------------------------------------
+# OpenCode answers a rate-limited request with 429 and, in some paths, an
+# explicit Retry-After: seconds-until-the-next-00:00-UTC for the daily free
+# quota, or a short window for a burst ceiling. When the header is present we
+# honour it (capped); otherwise we fall back to the configured cooldown.
+
+RATE_LIMIT_COOLDOWN = 300.0        # 5 minutes, per the routing rule
+RATE_LIMIT_COOLDOWN_MAX = 86400.0  # never park a key longer than a day
+CACHE_MAX_ENTRIES = 64
+CACHE_MAX_AGE = 3600.0
+
+_cooldowns: dict[str, float] = {}       # key id -> epoch seconds when usable again
+_response_cache: dict[tuple, dict] = {}  # (provider, model) -> {"json", "at"}
+
+
+class AllKeysCoolingDown(RuntimeError):
+    """Every key for this target is serving a rate-limit cooldown."""
+
+    def __init__(self, retry_after: float, keys: int):
+        self.retry_after = retry_after
+        self.keys = keys
+        super().__init__(f"all {keys} key(s) cooling down for up to {retry_after:.0f}s")
+
+
+def _cooldown_key(entry: dict) -> str:
+    return str(entry.get("id") or entry.get("key") or "")
+
+
+def prune_cooldowns(now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    for k in [k for k, until in _cooldowns.items() if until <= now]:
+        _cooldowns.pop(k, None)
+
+
+def key_is_cooling(entry: dict, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    until = _cooldowns.get(_cooldown_key(entry))
+    return bool(until and until > now)
+
+
+def key_cooldown_remaining(entry: dict, now: float | None = None) -> float:
+    now = time.time() if now is None else now
+    return max(0.0, _cooldowns.get(_cooldown_key(entry), 0.0) - now)
+
+
+def mark_key_cooling(entry: dict, seconds: float | None = None) -> float:
+    """Park a key. Returns the seconds applied."""
+    secs = RATE_LIMIT_COOLDOWN if seconds is None else float(seconds)
+    secs = max(RATE_LIMIT_COOLDOWN, min(secs, RATE_LIMIT_COOLDOWN_MAX))
+    ident = _cooldown_key(entry)
+    if not ident:
+        return 0.0
+    _cooldowns[ident] = time.time() + secs
+    prune_cooldowns()
+    return secs
+
+
+def retry_after_seconds(resp) -> float | None:
+    """Parse Retry-After / retry-after-ms / x-ratelimit-reset from a 429."""
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    try:
+        # requests' CaseInsensitiveDict already normalises, but a plain dict in
+        # tests or a hand-rolled response should work too.
+        lower = {str(k).lower(): v for k, v in headers.items()}
+    except (AttributeError, TypeError):
+        return None
+    raw = lower.get("retry-after-ms")
+    if raw not in (None, ""):
+        try:
+            return max(0.0, float(raw) / 1000.0)
+        except (TypeError, ValueError):
+            pass
+    raw = lower.get("retry-after")
+    if raw not in (None, ""):
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            import email.utils as _eu
+            try:
+                dt = _eu.parsedate_to_datetime(str(raw))
+                if dt is not None:
+                    return max(0.0, dt.timestamp() - time.time())
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def cooling_key_report(provider: str) -> list[dict]:
+    """Cooling keys for a provider, newest first (for the admin UI)."""
+    now = time.time()
+    prune_cooldowns(now)
+    with _lock:
+        data = load_data()
+    out = []
+    for entry in data.get("provider_keys", []):
+        if not isinstance(entry, dict) or (entry.get("provider") or "") != provider:
+            continue
+        left = key_cooldown_remaining(entry, now)
+        if left > 0:
+            out.append({"id": entry.get("id"), "label": entry.get("label"),
+                        "retry_after": round(left, 1)})
+    return sorted(out, key=lambda r: -r["retry_after"])
+
+
+def cache_store_response(provider: str, model: str, payload: dict) -> None:
+    """Remember the last good non-streaming response for a target."""
+    if not isinstance(payload, dict) or not provider or not model:
+        return
+    _response_cache[(provider, model)] = {"json": payload, "at": time.time()}
+    if len(_response_cache) > CACHE_MAX_ENTRIES:
+        oldest = min(_response_cache.items(), key=lambda kv: kv[1]["at"])[0]
+        _response_cache.pop(oldest, None)
+
+
+def cache_get_response(provider: str, model: str) -> dict | None:
+    hit = _response_cache.get((provider, model))
+    if not hit:
+        return None
+    if time.time() - hit["at"] > CACHE_MAX_AGE:
+        return None
+    return hit
+
+
+def served_from_cache(provider_id: str, upstream_model: str, router_model: str,
+                      cooling: AllKeysCoolingDown, anthropic: bool = False):
+    """Serve the last good response while every key is rate-limited.
+
+    This is a liveness shim, not a cache: the payload answers an earlier
+    prompt, not this one. It is flagged in the body and in X-Samet-Router so a
+    caller can tell. With nothing cached we return an honest 429 that carries
+    the remaining cooldown so the client can back off.
+    """
+    wait = max(1, int(cooling.retry_after))
+    stale = cache_get_response(provider_id, upstream_model)
+    if stale is None:
+        message = ("every key for %s is rate limited; retry in about %ds"
+                   % (provider_id or "this provider", wait))
+        payload = ({"type": "error", "error": {"type": "rate_limit_error",
+                                               "message": message}} if anthropic
+                   else {"error": {"message": message, "type": "rate_limit_error"}})
+        resp = jsonify(payload)
+        resp.status_code = 429
+        resp.headers["Retry-After"] = str(wait)
+        resp.headers["X-Samet-Router"] = "all-keys-cooling"
+        return resp
+
+    out = dict(stale["json"])
+    if anthropic:
+        out["type"] = "message"
+    out["model"] = router_model
+    out["samet_router"] = {
+        "stale": True,
+        "reason": "all provider keys are rate limited",
+        "served_at": int(stale["at"]),
+        "age_seconds": int(time.time() - stale["at"]),
+        "retry_after": wait,
+    }
+    resp = jsonify(out)
+    resp.headers["X-Samet-Router"] = "stale-response"
+    resp.headers["Retry-After"] = str(wait)
+    return resp
+
+
 def provider_catalog() -> list[dict]:
     """Provider catalog for the admin UI (pure function)."""
     out = []
@@ -2224,12 +2391,18 @@ def _ordered_pool(data: dict, protocol: str, provider: str = "") -> list[dict]:
             "Add one in /admin first.")
     # lower priority number = tried first (1 is highest priority)
     pool = sorted(pool, key=lambda k: int(k.get("priority", 1) or 1))
+    prune_cooldowns()
+    usable = [k for k in pool if not key_is_cooling(k)]
+    if not usable:
+        # keys exist but every one is serving a rate-limit cooldown
+        worst = max((key_cooldown_remaining(k) for k in pool), default=0.0)
+        raise AllKeysCoolingDown(worst, len(pool))
     round_robin = bool((data.get("settings", {}) or {}).get("round_robin", True))
     if not round_robin:
-        return pool
+        return usable
     cursor = pool_cursor(protocol, provider)
-    start = int((data.get("provider_index", {}) or {}).get(cursor, 0) or 0) % len(pool)
-    return pool[start:] + pool[:start]
+    start = int((data.get("provider_index", {}) or {}).get(cursor, 0) or 0) % len(usable)
+    return usable[start:] + usable[:start]
 
 
 def pool_cursor(protocol: str, provider: str = "") -> str:
@@ -3111,7 +3284,21 @@ def call_upstream(protocol: str, body: dict, gemini_model: str = "",
         if resp.status_code == 200:
             _advance_provider_index(protocol, len(pool), provider)
             return entry, resp
-        if resp.status_code in (401, 403, 429) and i < len(pool) - 1:
+        if resp.status_code == 429:
+            # rate limited: park this key so later requests skip it. honour an
+            # explicit Retry-After when upstream sent one (OpenCode's daily free
+            # quota resets at 00:00 UTC and reports ~19h, far past our 5 min).
+            secs = mark_key_cooling(entry, retry_after_seconds(resp))
+            if i < len(pool) - 1:
+                _close_quietly(resp)
+                last_exc = RuntimeError(f"upstream 429: {resp.text[:300]}")
+                continue
+            # pool held only usable keys, so parking this one empties it. Raise so
+            # the handler can replay its cached response instead of surfacing a
+            # bare 429 to the caller.
+            _close_quietly(resp)
+            raise AllKeysCoolingDown(secs, len(pool))
+        if resp.status_code in (401, 403) and i < len(pool) - 1:
             _close_quietly(resp)
             last_exc = RuntimeError(f"upstream {resp.status_code}: {resp.text[:300]}")
             continue
@@ -3624,6 +3811,7 @@ def create_app() -> Flask:
             "count": len(keys),
             "settings": get_provider_settings(data, pid),
             "connections": [_masked_provider_key(k) for k in keys],
+            "cooling": cooling_key_report(pid),
             "models": [{"name": m.get("name", ""),
                         "upstream_model": str(m.get("upstream_model") or m.get("gemini_model") or ""),
                         "description": m.get("description", ""),
@@ -4179,6 +4367,7 @@ def create_app() -> Flask:
                             int(u.get("prompt_tokens", 0) or 0),
                             int(u.get("completion_tokens", 0) or 0),
                             kid, klabel, provider, thinking)
+                    cache_store_response(target.get("provider_id") or "", upstream, j)
                     return jsonify(j)
                 j = resp.json()
                 j["model"] = router_model
@@ -4189,6 +4378,8 @@ def create_app() -> Flask:
                         int(u.get("prompt_tokens", 0) or 0),
                         int(u.get("completion_tokens", 0) or 0),
                         kid, klabel, provider, thinking)
+                if not stream:
+                    cache_store_response(target.get("provider_id") or "", upstream, j)
                 return jsonify(j)
 
             if provider == "anthropic":
@@ -4272,6 +4463,16 @@ def create_app() -> Flask:
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
             return jsonify(oai)
+        except AllKeysCoolingDown as cooling:
+            # every key is parked by a rate limit: serve the last good answer if
+            # we have one, otherwise an honest 429 carrying Retry-After.
+            stale = cache_get_response(target.get("provider_id") or "", upstream) is not None
+            add_log(ep, router_model, stale,
+                    int((time.time() - t0) * 1000),
+                    "" if stale else str(cooling),
+                    0, 0, kid, klabel, provider, thinking)
+            return served_from_cache(target.get("provider_id") or "", upstream,
+                                     router_model, cooling)
         except Exception as exc:  # noqa: BLE001 - error is returned to the client in simplified form
             add_log(ep, router_model, False,
                     int((time.time() - t0) * 1000), str(exc),
