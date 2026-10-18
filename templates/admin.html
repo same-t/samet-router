@@ -8,19 +8,7 @@
 </head>
 <body>
 <div class="layout">
-  <aside class="sidebar">
-    <div class="brand">◈ Samet Router</div>
-    <nav>
-      <button data-tab="dashboard" class="active">Dashboard</button>
-      <button data-tab="router-keys">User Keys</button>
-      <button data-tab="keys">Provider Keys</button>
-      <button data-tab="models">Models</button>
-      <button data-tab="prompt">Prompt</button>
-      <button data-tab="logs">Recent Requests</button>
-      <button data-tab="docs">Docs</button>
-    </nav>
-    <div class="side-foot">Backend: OpenAI · Anthropic · Gemini<br/>Compatibility: OpenAI · Anthropic · Gemini</div>
-  </aside>
+  {% include "_sidebar.html" %}
   <main class="content">
     <header><h1>Admin Panel</h1><span id="status" class="pill">loading…</span></header>
 
@@ -82,50 +70,68 @@
       <tbody id="rk-body"></tbody></table>
     </section>
 
-    <section id="tab-keys" class="tab hidden">
-      <h3>Provider Keys <small>(upstream, not shown to clients)</small></h3>
-      <p class="hint">Select <b>which provider a key belongs to</b> (billing/ownership),
-      select <b>which protocol to speak with the key</b> (request format), and
-      set <b>where to send requests</b> via the <code>base URL</code>.
-      Leave it empty to use the provider's default address.</p>
-      <div class="row">
-        <input id="key-value" placeholder="API key" size="36" />
-        <input id="key-label" placeholder="label" />
+    <section id="tab-providers" class="tab hidden">
+      <div class="prov-head">
+        <h3 class="prov-title">Free Tier Providers</h3>
+        <button class="ghost" onclick="testAllConnections()">▶ Test All</button>
       </div>
-      <div class="row">
-        <label>Provider <select id="key-provider"></select></label>
-        <label>Protocol <select id="key-protocol">
-          <option value="">provider default</option>
-          <option value="openai">OpenAI (chat/completions)</option>
-          <option value="anthropic">Anthropic (messages)</option>
-          <option value="gemini">Gemini (generateContent)</option>
-        </select></label>
+      <div class="prov-grid" id="prov-grid"></div>
+      <p class="hint">OpenCode kartına tıklayarak bağlantı/kimlik ve model yönetimi sayfasını aç.</p>
+    </section>
+
+    <section id="tab-combos" class="tab hidden">
+      <div class="prov-head">
+        <h3 class="prov-title">Combos <small>(one name → one model)</small></h3>
+        <button onclick="openComboModal()">＋ Create Combo</button>
       </div>
+      <p class="hint">A combo is a second name for a model you already added. Clients can ask
+        for the combo name and it resolves straight to that model — the combo appears in
+        <code>GET /v1/models</code> like any other model id.</p>
+      <div id="combo-list" style="margin-top:14px"></div>
+    </section>
+
+    <section id="tab-proxies" class="tab hidden">
+      <h3>Proxy Pools <small>(provider sayfasından seçilir)</small></h3>
+      <p class="hint">Her satıra bir proxy yaz (<code>http://user:pass@host:port</code>). Provider ayarındaki Rotation Strategy
+      ile birden çok havuz arasında döndürülebilir.</p>
       <div class="row">
-        <input id="key-base" placeholder="base URL (empty = default)" size="46" />
-        <button onclick="addKey()">Add</button>
+        <input id="pool-name" placeholder="pool adı (ör. residential-us)" />
+        <input id="pool-proxies" placeholder="http://user:pass@host:port" size="46" />
+        <button onclick="addPool()">Add pool</button>
       </div>
-      <p class="hint" id="key-default-hint"></p>
-      <table><thead><tr><th>Label</th><th>Provider</th><th>Protocol</th><th>Base URL</th><th>Masked</th><th>Created</th><th></th></tr></thead>
-      <tbody id="keys-body"></tbody></table>
-      <p class="hint">Keys speaking the same protocol are pooled; requests are distributed in order (round-robin), and the next key is tried on 401/403/429.</p>
+      <table><thead><tr><th>Name</th><th>Proxies</th><th>Created</th><th></th></tr></thead>
+      <tbody id="pools-body"></tbody></table>
     </section>
 
     <section id="tab-models" class="tab hidden">
       <h3>Model mappings <small>(router name → provider + upstream model)</small></h3>
       <div class="row">
         <input id="model-name" placeholder="samet-flash" />
-        <select id="model-provider">
-          <option value="gemini">gemini</option>
-          <option value="openai">openai</option>
-          <option value="anthropic">anthropic</option>
-        </select>
+        <select id="model-provider"></select>
         <input id="model-upstream" placeholder="upstream model (e.g.: gpt-4o-mini)" size="30" />
         <input id="model-desc" placeholder="description" />
         <button onclick="addModel()">Add</button>
       </div>
       <table><thead><tr><th>Router name</th><th>Provider</th><th>Upstream model</th><th>Description</th><th></th></tr></thead>
       <tbody id="models-body"></tbody></table>
+    </section>
+
+    <section id="tab-playground" class="tab hidden">
+      <div class="pg-head">
+        <h3>Playground</h3>
+        <button class="ghost" onclick="pgClear()">Clear chat</button>
+      </div>
+      <div class="pg-toolbar">
+        <label class="fld">Provider</label>
+        <select id="pg-provider" onchange="pgProviderChanged()"></select>
+        <label class="fld">Model</label>
+        <select id="pg-model"></select>
+      </div>
+      <div class="pg-chat" id="pg-chat"></div>
+      <div class="pg-input">
+        <textarea id="pg-text" rows="2" placeholder="Mesajınızı yazın… (Enter = gönder, Shift+Enter = yeni satır)"></textarea>
+        <button id="pg-send" onclick="pgSend()">Send</button>
+      </div>
     </section>
 
     <section id="tab-prompt" class="tab hidden">
@@ -158,14 +164,20 @@
 
     <section id="tab-docs" class="tab hidden">
       <h3>Setup order</h3>
-      <pre><code># 1) Add an upstream key from "Provider Keys":
+      <pre><code># 1) Add an upstream key from "Providers":
 #      provider=openai  + protocol=openai    → OpenAI / OpenAI-compatible server
 #      provider=anthropic + protocol=anthropic → real Anthropic
 #      provider=gemini  + protocol=gemini    → Google AI Studio (AIza...)
+#      provider=commandcode                 → Command Code (api.commandcode.ai)
 #      provider=custom  + base URL           → Ollama / vLLM / DeepSeek etc.
 # 2) From "Models", map router name → provider + upstream model
 #    (e.g.: gpt-mini → openai/gpt-4o-mini,  claude-alias → anthropic/claude-sonnet-4-5)
+# 2b) From "Combos", give an existing model a second name (e.g. samet).
+#     Combos are listed in /v1/models and resolve to their model.
 # 3) From "User Keys", generate a client key (sk-samet-...) and use it in the client.</code></pre>
+      <p class="hint">Command Code rides the OpenAI protocol, so it reaches
+        <code>/chat/completions</code>. Its Claude models only answer on
+        <code>/messages</code> and will 400 here.</p>
       <h3>Client examples</h3>
       <pre><code># OpenAI-compatible (python, incl. tools + stream)
 from openai import OpenAI
@@ -207,7 +219,198 @@ print(c.messages.create(model="claude-alias", max_tokens=2000,
     </section>
   </main>
 </div>
+
+<div id="combo-modal" class="modal-backdrop hidden">
+  <div class="modal wide">
+    <div class="modal-head">
+      <span class="dots"><i class="dot red"></i><i class="dot yellow"></i><i class="dot green"></i></span>
+      <span id="combo-modal-title">Create Combo</span>
+    </div>
+    <div class="modal-body">
+      <label class="fld" for="combo-name">Combo Name</label>
+      <input id="combo-name" placeholder="samet" autocomplete="off" />
+      <p class="hint">Letters, numbers, <code>.</code>, <code>_</code> and <code>-</code> only.
+        This is the id clients send and the name listed in <code>/v1/models</code>.</p>
+
+      <label class="fld">Model</label>
+      <div class="combo-pick">
+        <div id="combo-picked" class="empty">No model selected yet</div>
+        <div><button class="ghost" onclick="openPicker()">＋ Select model</button></div>
+      </div>
+      <label class="fld" for="combo-desc">Description <small>(optional)</small></label>
+      <input id="combo-desc" placeholder="what this combo is for" autocomplete="off" />
+    </div>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeComboModal()">Cancel</button>
+      <button class="btn-save" id="combo-save" onclick="saveCombo()" disabled>Create</button>
+    </div>
+  </div>
+</div>
+
+<div id="picker-modal" class="modal-backdrop hidden">
+  <div class="modal wide">
+    <div class="modal-head">
+      <span class="dots"><i class="dot red"></i><i class="dot yellow"></i><i class="dot green"></i></span>
+      <span>Select Model</span>
+    </div>
+    <div class="modal-body">
+      <div class="picker-search">
+        <span class="mag">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <circle cx="11" cy="11" r="7" /><path d="M20 20l-3.5-3.5" stroke-linecap="round"/>
+          </svg>
+        </span>
+        <input id="picker-q" placeholder="Search models (e.g. cmd, beam, gpt)…" autocomplete="off" />
+      </div>
+      <div class="picker-meta">
+        <span id="picker-count">0 models</span>
+        <span>one model per combo</span>
+      </div>
+      <div id="picker-body" style="max-height:46vh;overflow-y:auto"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closePicker()">Cancel</button>
+      <button class="btn-save" onclick="closePicker()">Done</button>
+    </div>
+  </div>
+</div>
+
 <script>
+/* ---------------------------------------------------------------- combos */
+let COMBOS = [], PICKABLE = [], COMBO_PICK = '';
+
+function provMetaOf(name) {
+  const m = String(name || '').match(/^([^/]+)\/(.*)$/);
+  if (!m) return { provider: '', label: name || '', model: name || '' };
+  const short = (m[1] || '').split('-')[0];
+  return { provider: short, label: PROVIDER_LABELS[short] || m[1], model: m[1] + '/' + m[2] };
+}
+
+async function loadCombos() {
+  const r = await fetch('/admin/api/combos');
+  if (!r.ok) return;
+  const j = await r.json();
+  COMBOS = j.combos || [];
+  PICKABLE = j.pickable || [];
+  renderCombos();
+}
+
+function renderCombos() {
+  const box = $('combo-list');
+  if (!box) return;
+  if (!COMBOS.length) {
+    box.innerHTML = '<p class="hint">No combos yet. Create one to give a model a second name.</p>';
+    return;
+  }
+  box.innerHTML = COMBOS.map(c => `
+    <div class="combo-row">
+      <div class="combo-main">
+        <div class="combo-title">${esc(c.id)}</div>
+        <div class="combo-sub">
+          <span class="tag acc">${esc(c.combo_model || '-')}</span>
+          <span class="tag">${esc(c.meta.provider)}</span>
+          ${c.description ? `<span>${esc(c.description)}</span>` : ''}
+        </div>
+      </div>
+      <div class="combo-actions">
+        <button title="Copy the id clients send" onclick="copyText('${esc(c.id)}')">Copy</button>
+        <button onclick="openComboModal('${esc(c.id)}')">Edit</button>
+        <button class="danger" onclick="delCombo('${esc(c.id)}')">Delete</button>
+      </div>
+    </div>`).join('');
+}
+
+function openComboModal(name) {
+  const editing = name ? COMBOS.find(c => c.id === name) : null;
+  $('combo-modal-title').textContent = editing ? 'Edit Combo' : 'Create Combo';
+  $('combo-save').textContent = editing ? 'Save' : 'Create';
+  $('combo-name').value = editing ? editing.id : '';
+  $('combo-desc').value = editing ? (editing.description || '') : '';
+  COMBO_PICK = editing ? (editing.combo_model || '') : '';
+  renderComboPicked();
+  $('combo-modal').classList.remove('hidden');
+  setTimeout(() => $('combo-name').focus(), 30);
+}
+
+function closeComboModal() { $('combo-modal').classList.add('hidden'); }
+
+function renderComboPicked() {
+  const box = $('combo-picked');
+  const ok = $('combo-name').value.trim() && COMBO_PICK;
+  $('combo-save').disabled = !ok;
+  if (!COMBO_PICK) {
+    box.className = 'empty';
+    box.textContent = 'No model selected yet';
+    return;
+  }
+  const meta = (STATE && STATE.models || []).find(m => m.name === COMBO_PICK);
+  box.className = '';
+  box.innerHTML = `<span class="tag acc">${esc(COMBO_PICK)}</span>` +
+    (meta ? `<span class="tag">${esc(meta.provider)}</span>` : '') +
+    ` <button class="ghost" style="padding:2px 8px;font-size:11.5px" onclick="COMBO_PICK='';renderComboPicked()">clear</button>`;
+}
+
+async function saveCombo() {
+  const name = $('combo-name').value.trim();
+  if (!name || !COMBO_PICK) return;
+  $('combo-save').disabled = true;
+  const r = await fetch('/admin/api/combos', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, model: COMBO_PICK, description: $('combo-desc').value.trim() }),
+  });
+  const j = await r.json().catch(() => ({}));
+  $('combo-save').disabled = false;
+  if (!r.ok) return alert('error: ' + (j.error || await r.text()));
+  closeComboModal();
+  await loadCombos();
+  if (STATE) renderPickers();
+}
+
+async function delCombo(name) {
+  if (!confirm(`Delete combo "${name}"?`)) return;
+  await fetch('/admin/api/combos/' + encodeURIComponent(name), { method: 'DELETE' });
+  await loadCombos();
+}
+
+function openPicker() {
+  $('picker-q').value = '';
+  renderPickers();
+  $('picker-modal').classList.remove('hidden');
+  setTimeout(() => $('picker-q').focus(), 30);
+}
+function closePicker() { $('picker-modal').classList.add('hidden'); }
+
+function renderPickers() {
+  const q = $('picker-q').value.trim().toLowerCase();
+  const box = $('picker-body');
+  if (!box) return;
+  const hits = PICKABLE.filter(n => !q || n.toLowerCase().includes(q));
+  $('picker-count').textContent = `${hits.length} model${hits.length === 1 ? '' : 's'}`;
+  if (!hits.length) {
+    box.innerHTML = '<p class="hint" style="padding:10px 0">No models match. Add one in the Models tab first.</p>';
+    return;
+  }
+  const groups = {};
+  hits.forEach(n => {
+    const key = provMetaOf(n).provider || 'other';
+    (groups[key] = groups[key] || []).push(n);
+  });
+  box.innerHTML = Object.keys(groups).sort().map(g => `
+    <div class="pick-group-label">${esc(PROVIDER_LABELS[g] || g)} <span class="count">(${groups[g].length})</span></div>
+    <div class="pick-list">${groups[g].map(n => `
+      <button class="pick-chip${n === COMBO_PICK ? ' on' : ''}"
+              onclick="pickModel('${esc(n)}')">
+        <span class="dotmark"></span>${esc(n)}
+      </button>`).join('')}</div>`).join('');
+}
+
+function pickModel(n) {
+  // a combo holds exactly one model: clicking replaces the current pick
+  COMBO_PICK = n;
+  renderComboPicked();
+  renderPickers();
+}
+
 const $ = id => document.getElementById(id);
 document.querySelectorAll('.sidebar nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('.sidebar nav button').forEach(x => x.classList.remove('active'));
@@ -235,7 +438,10 @@ async function refresh() {
   $('d-by-endpoint').innerHTML = Object.entries(st.by_endpoint||{}).map(([k,v]) => row(k,v)).join('') || '<tr><td colspan="6" class="hint">no data yet</td></tr>';
   $('d-by-provider').innerHTML = Object.entries(st.by_provider||{}).map(([k,v]) => row(k,v)).join('') || '<tr><td colspan="6" class="hint">no data yet</td></tr>';
   $('d-thinking').textContent = st.thinking_requests ? `· 🧠 thinking requests: ${fmt(st.thinking_requests)}` : '';
-  renderProviderSelect(s.providers || []);
+  renderProviders(s);
+  loadPools();
+  loadCombos();
+  pgRender();
   const days = Object.entries(st.by_day||{}).sort().slice(-14);
   const maxReq = Math.max(1, ...days.map(([,v]) => v.requests));
   $('d-by-day').innerHTML = days.map(([k,v]) => {
@@ -245,9 +451,6 @@ async function refresh() {
   $('rk-body').innerHTML = (s.router_keys||[]).map(k =>
     `<tr><td>${esc(k.label)}</td><td><code>${esc(k.masked||k.prefix||'')}</code></td><td>${esc(k.created_at||'')}</td><td>${esc(k.last_used_at||'-')}</td><td>${fmt(k.request_count)}</td><td><button class="danger" onclick="delRouterKey('${k.id}')">Revoke</button></td></tr>`).join('')
     || '<tr><td colspan="6" class="hint">no user keys yet — generate one above</td></tr>';
-  $('keys-body').innerHTML = (s.provider_keys||[]).map(k =>
-    `<tr><td>${esc(k.label)}</td><td><code>${esc(k.provider)}</code></td><td><code>${esc(k.protocol)}</code></td><td><small>${esc(shortBase(k.effective_base||k.base_url||''))}</small></td><td><code>${esc(k.key)}</code></td><td>${esc((k.created_at||'').slice(0,19).replace('T',' '))}</td><td><button onclick="delKey('${k.id}')">Delete</button></td></tr>`).join('')
-    || '<tr><td colspan="7" class="hint">no provider keys yet</td></tr>';
   $('models-body').innerHTML = s.models.map(m =>
     `<tr><td><code>${esc(m.name)}</code></td><td><code>${esc(m.provider||'gemini')}</code></td><td>${esc(m.upstream_model||m.gemini_model||'')}</td><td>${esc(m.description||'')}</td><td><button onclick="delModel('${esc(m.name)}')">Delete</button></td></tr>`).join('');
   $('logs-body').innerHTML = s.logs.map(l =>
@@ -255,46 +458,186 @@ async function refresh() {
   if (s.settings && $('default-system')) $('default-system').value = s.settings.default_system || '';
 }
 function esc(s){ return String(s??'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-function shortBase(u){ u = String(u||''); try { const x = new URL(u); return x.host + (x.pathname.length > 1 ? x.pathname : ''); } catch(e){ return u.slice(0, 40); } }
-let PROVIDERS = [];
-function renderProviderSelect(providers) {
-  PROVIDERS = providers;
-  const sel = $('key-provider');
-  if (!sel.options.length) {
-    providers.forEach(p => {
-      const o = document.createElement('option');
-      o.value = p.id; o.textContent = p.id;
-      sel.appendChild(o);
-    });
-    sel.value = 'gemini';
-    sel.onchange = updateKeyHint;
-    $('key-protocol').onchange = updateKeyHint;
+let STATE = null;
+const PROVIDER_LOGOS = {
+  opencode: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none"><rect x="3" y="4.5" width="18" height="15" rx="4" stroke="currentColor" stroke-width="1.7"/><rect x="8" y="9.5" width="8" height="5" rx="1.2" fill="currentColor"/></svg>',
+  openai: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none"><circle cx="12" cy="12" r="8.5" stroke="currentColor" stroke-width="1.7"/><path d="M9 15V9l6 6V9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  anthropic: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none"><path d="M7 4v16M17 4v16M7 12h10" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
+  gemini: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none"><path d="M12 3l1.9 5.6L19.5 10l-5.6 1.9L12 17.5l-1.9-5.6L4.5 10l5.6-1.4z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>',
+  commandcode: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none"><rect x="3" y="4.5" width="18" height="15" rx="4" stroke="currentColor" stroke-width="1.7"/><path d="M8.5 10l-2 2 2 2M15.5 10l2 2-2 2M13 9l-2 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  custom: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none"><circle cx="12" cy="12" r="3.2" stroke="currentColor" stroke-width="1.7"/><path d="M12 3.5v3M12 17.5v3M3.5 12h3M17.5 12h3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
+};
+const PROVIDER_FALLBACK_LOGO = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none"><rect x="3.5" y="4.5" width="17" height="15" rx="4" stroke="currentColor" stroke-width="1.7"/><circle cx="8.5" cy="9.5" r="1.2" fill="currentColor"/><circle cx="12" cy="9.5" r="1.2" fill="currentColor"/><circle cx="15.5" cy="9.5" r="1.2" fill="currentColor"/></svg>';
+const PROVIDER_LABELS = { opencode: 'OpenCode Free', openai: 'OpenAI', anthropic: 'Anthropic', gemini: 'Gemini', commandcode: 'Command Code', custom: 'Custom' };
+function provLabel(p) { return PROVIDER_LABELS[p] || p; }
+
+function renderProviders(s) {
+  STATE = s;
+  const catalog = (s && s.providers) || [];
+  const conns = s.provider_keys || [];
+  const counts = {};
+  conns.forEach(k => { const p = (k && k.provider) || 'gemini'; counts[p] = (counts[p] || 0) + 1; });
+  const cards = catalog.map(p => {
+    const n = counts[p.id] || 0;
+    const status = n
+      ? `<span class="prov-status ready"><i class="rdot"></i> ${n} connection${n > 1 ? 's' : ''}</span>`
+      : `<span class="prov-status">No connections</span>`;
+    const logo = PROVIDER_LOGOS[p.id] || PROVIDER_FALLBACK_LOGO;
+    return `<a class="prov-card" href="/admin/providers/${encodeURIComponent(p.id)}">
+       <span class="prov-ico">${logo}</span>
+       <span class="prov-info">
+         <span class="prov-name">${esc(provLabel(p.id))}</span>
+         ${status}
+       </span>
+       <span class="prov-chevron">›</span>
+     </a>`;
+  });
+  $('prov-grid').innerHTML = cards.join('') ||
+    '<span class="hint">no providers available</span>';
+  const sel = $('model-provider');
+  if (sel) {
+    const prev = sel.value;
+    sel.innerHTML = catalog.map(p =>
+      `<option value="${esc(p.id)}">${esc(provLabel(p.id))}</option>`).join('');
+    if (prev) sel.value = prev;
   }
-  updateKeyHint();
 }
-function provOf(id){ return PROVIDERS.find(p => p.id === id) || {}; }
-function updateKeyHint() {
-  const p = provOf($('key-provider').value);
-  const proto = $('key-protocol').value || p.protocol || '';
-  $('key-base').placeholder = 'base URL (empty = ' + (p.base_url || 'none') + ')';
-  $('key-value').placeholder = p.key_hint ? ('API key (' + p.key_hint + ')') : 'API key';
-  $('key-default-hint').textContent =
-    'Selected: provider=' + ($('key-provider').value||'?') +
-    ' → protocol=' + (proto||'?') +
-    ' → address=' + ($('key-base').value.trim() || p.base_url || '(required for custom)');
+async function testAllConnections() {
+  const r = await fetch('/admin/api/provider-keys/test-all', { method: 'POST' });
+  const j = await r.json();
+  const res = j.results || [];
+  if (!res.length) return alert('No connections to test.');
+  const bad = res.filter(x => !x.ok);
+  alert(`Tested ${res.length} connection(s): ${res.length - bad.length} OK, ${bad.length} failed.`
+    + (bad.length ? '\n\n' + bad.map(b => `${b.label}: ${b.message}`).join('\n') : ''));
 }
-async function addKey() {
-  const key = $('key-value').value.trim();
-  const label = $('key-label').value.trim();
-  const provider = $('key-provider').value;
-  const protocol = $('key-protocol').value || null;
-  const base_url = $('key-base').value.trim();
-  if (!key) return alert('enter a key');
-  const r = await fetch('/admin/api/provider-keys', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key, label, provider, protocol, base_url})});
+async function loadPools() {
+  const r = await fetch('/admin/api/proxy-pools');
+  if (!r.ok) return;
+  const j = await r.json();
+  const pools = Array.isArray(j) ? j : (j.pools || []);
+  $('pools-body').innerHTML = pools.map(p =>
+    `<tr><td><code>${esc(p.name)}</code></td><td>${(p.proxies || []).map(x => `<code>${esc(x)}</code>`).join('<br>')}</td><td>${esc((p.created_at || '').slice(0, 10))}</td><td><button class="danger" onclick="delPool('${p.id}')">Delete</button></td></tr>`).join('')
+    || '<tr><td colspan="4" class="hint">no proxy pools yet</td></tr>';
+}
+async function addPool() {
+  const name = $('pool-name').value.trim();
+  const proxies = $('pool-proxies').value.split('\n').map(s => s.trim()).filter(Boolean);
+  if (!name) return alert('enter a pool name');
+  if (!proxies.length) return alert('enter at least one proxy');
+  const r = await fetch('/admin/api/proxy-pools', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, proxies }),
+  });
   if (!r.ok) return alert('error: ' + await r.text());
-  $('key-value').value=''; $('key-base').value=''; refresh();
+  $('pool-name').value = ''; $('pool-proxies').value = '';
+  loadPools();
 }
-async function delKey(id){ await fetch('/admin/api/provider-keys/'+id, {method:'DELETE'}); refresh(); }
+async function delPool(id) {
+  if (!confirm('Delete this proxy pool?')) return;
+  await fetch('/admin/api/proxy-pools/' + id, { method: 'DELETE' });
+  loadPools();
+}
+const PG_PROVIDER_LABELS = PROVIDER_LABELS;
+let PG_HISTORY = [];
+function pgLabel(p) { return PG_PROVIDER_LABELS[p] || p; }
+function pgRender() {
+  const models = ((STATE && STATE.models) || []).filter(m => !m.disabled);
+  const provs = [...new Set(models.map(m => m.provider || 'gemini'))];
+  const sel = $('pg-provider');
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = provs.map(p => `<option value="${p}">${esc(pgLabel(p))}</option>`).join('')
+    || '<option value="">no models</option>';
+  sel.value = provs.includes(prev) ? prev : (provs[0] || '');
+  pgProviderChanged();
+}
+function pgProviderChanged() {
+  const p = $('pg-provider').value;
+  const models = ((STATE && STATE.models) || []).filter(m => !m.disabled && (m.provider || 'gemini') === p);
+  const sel = $('pg-model');
+  const prev = sel.value;
+  sel.innerHTML = models.map(m =>
+    `<option value="${esc(m.name)}">${esc(m.name)} → ${esc(m.upstream_model || m.gemini_model || '')}</option>`).join('')
+    || '<option value="">no models</option>';
+  if (models.some(m => m.name === prev)) sel.value = prev;
+}
+function pgAppend(role, text) {
+  const wrap = document.createElement('div');
+  wrap.className = 'pg-msg ' + role;
+  const who = document.createElement('div');
+  who.className = 'pg-who';
+  who.textContent = role === 'user' ? 'You' : 'Assistant';
+  const body = document.createElement('div');
+  body.className = 'pg-body';
+  body.textContent = text;
+  wrap.appendChild(who); wrap.appendChild(body);
+  $('pg-chat').appendChild(wrap);
+  pgScroll();
+  return body;
+}
+function pgScroll() { const c = $('pg-chat'); c.scrollTop = c.scrollHeight; }
+function pgClear() {
+  PG_HISTORY = [];
+  $('pg-chat').innerHTML = '<div class="pg-empty">Bir model seçin ve sohbete başlayın.</div>';
+}
+async function pgSend() {
+  const text = $('pg-text').value.trim();
+  const model = $('pg-model').value;
+  if (!text) return;
+  if (!model) return alert('select a model');
+  if (document.querySelector('.pg-empty')) $('pg-chat').innerHTML = '';
+  $('pg-text').value = '';
+  PG_HISTORY.push({ role: 'user', content: text });
+  pgAppend('user', text);
+  const asst = pgAppend('assistant', '');
+  const btn = $('pg-send');
+  btn.disabled = true;
+  let content = '';
+  try {
+    const r = await fetch('/admin/api/playground/chat', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, messages: PG_HISTORY, stream: true }),
+    });
+    if (!r.ok || !r.body) {
+      const t = await r.text();
+      asst.closest('.pg-msg').classList.add('err');
+      asst.textContent = '⚠ ' + (t || ('HTTP ' + r.status));
+      PG_HISTORY.pop();
+      return;
+    }
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        try {
+          const j = JSON.parse(payload);
+          const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
+          if (d.content) { content += d.content; asst.textContent = content; pgScroll(); }
+        } catch (e) {}
+      }
+    }
+    if (content) PG_HISTORY.push({ role: 'assistant', content });
+    else asst.textContent = '(boş yanıt)';
+  } catch (e) {
+    asst.closest('.pg-msg').classList.add('err');
+    asst.textContent = '⚠ ' + e;
+  } finally {
+    btn.disabled = false;
+    $('pg-text').focus();
+    pgScroll();
+  }
+}
 async function addModel() {
   const name = $('model-name').value.trim(),
         provider = $('model-provider').value,
@@ -330,7 +673,30 @@ async function addRouterKey(){
   $('rk-new-value').textContent = j.key;
   $('rk-new').classList.remove('hidden');
   $('rk-label').value='';
-  refresh();
+const _tab = new URLSearchParams(location.search).get('tab');
+if (_tab) {
+  const btn = document.querySelector('.sidebar nav button[data-tab="' + _tab + '"]');
+  if (btn) btn.click();
+}
+pgClear();
+$('combo-name').addEventListener('input', renderComboPicked);
+$('combo-name').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !$('combo-save').disabled) saveCombo();
+});
+$('picker-q').addEventListener('input', renderPickers);
+document.querySelectorAll('.modal-backdrop').forEach(back => {
+  back.addEventListener('mousedown', e => { if (e.target === back) back.classList.add('hidden'); });
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    $('picker-modal').classList.add('hidden');
+    $('combo-modal').classList.add('hidden');
+  }
+});
+if ($('pg-text')) $('pg-text').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); pgSend(); }
+});
+refresh();
 }
 async function delRouterKey(id){
   if (!confirm('Revoke this key? Clients using it will get 401.')) return;
@@ -344,6 +710,7 @@ async function resetStats(){
   if (!confirm('Delete all statistics and recent request logs?')) return;
   await fetch('/admin/api/stats', {method:'DELETE'}); refresh();
 }
+function copyText(t){ navigator.clipboard?.writeText(t); }
 refresh();
 </script>
 </body>

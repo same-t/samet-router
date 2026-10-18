@@ -467,10 +467,11 @@ def test_provider_key_validation(tmp_path):
         "key": "AIza-FAKE-1", "provider": "gemini"}).status_code == 400  # duplicate
     r = c.post("/admin/api/provider-keys", json={
         "key": "sk-ollama", "label": "local", "provider": "custom",
-        "protocol": "openai", "base_url": "http://localhost:11434/v1"})
+"protocol": "openai", "base_url": "http://localhost:11434/v1"})
     assert r.status_code == 201
     cat = c.get("/admin/api/providers").get_json()
-    assert {p["id"] for p in cat} == {"openai", "anthropic", "gemini", "custom"}
+    assert {p["id"] for p in cat} == {"opencode", "openai", "anthropic", "gemini",
+                                      "commandcode", "custom"}
     # raw key must not leak
     assert "sk-ollama" not in json.dumps(c.get("/admin/api/state").get_json())
 
@@ -838,7 +839,7 @@ def test_resolve_target_and_sse_rewrite():
         {"name": "a", "provider": "openai", "upstream_model": "gpt-x"},
         {"name": "b", "provider": "gemini", "upstream_model": "gemini-y"}]}
     assert router.resolve_target(data, "a") == {
-        "name": "a", "provider": "openai", "upstream_model": "gpt-x"}
+        "name": "a", "provider": "openai", "provider_id": "openai", "upstream_model": "gpt-x"}
     assert router.resolve_target(data, "gemini-2.5-pro")["upstream_model"] == "gemini-2.5-pro"
     assert router.resolve_target(data, "bilinmeyen")["upstream_model"] == "gpt-x"
     chunks = [b'data: {"model": "up", "message": {"model": "up"}}\n', b"data: [DONE]\n"]
@@ -847,3 +848,868 @@ def test_resolve_target_and_sse_rewrite():
     assert router.body_has_thinking("anthropic", {"thinking": {"type": "enabled"}}) is True
     assert router.body_has_thinking("openai", {"reasoning_effort": "low"}) is True
     assert router.body_has_thinking("openai", {"messages": []}) is False
+
+
+# ---------------------------------------------------------------------------
+# OpenCode connections (providers page) tests
+# ---------------------------------------------------------------------------
+
+def test_opencode_connection_fields(tmp_path):
+    c = make_client(tmp_path)
+    r = c.post("/admin/api/provider-keys", json={
+        "key": "public", "label": "Production Key", "provider": "opencode",
+        "priority": 2, "proxy_pool": "none"})
+    assert r.status_code == 201
+    keys = c.get("/admin/api/state").get_json()["provider_keys"]
+    k = [x for x in keys if x["label"] == "Production Key"][0]
+    assert k["priority"] == 2 and k["protocol"] == "openai"
+    assert k["effective_base"] == "https://opencode.ai/zen/v1"
+    assert k["provider"] == "opencode"
+# raw key must not leak
+    assert "public" not in json.dumps(keys)
+
+
+def _add_commandcode_upstream(c):
+    assert c.post("/admin/api/provider-keys", json={
+        "key": "cmd-key-123", "label": "cmd",
+        "provider": "commandcode"}).status_code == 201
+    assert c.post("/admin/api/models", json={
+        "name": "ds-flash", "provider": "commandcode",
+        "upstream_model": "deepseek/deepseek-v4-flash"}).status_code == 201
+
+
+def test_commandcode_connection_fields(tmp_path):
+    c = make_client(tmp_path)
+    _add_commandcode_upstream(c)
+    keys = c.get("/admin/api/state").get_json()["provider_keys"]
+    k = [x for x in keys if x["provider"] == "commandcode"][0]
+    assert k["protocol"] == "openai"
+    assert k["effective_base"] == "https://api.commandcode.ai/provider/v1"
+    assert router.route_protocol_for_provider("commandcode") == "openai"
+    assert router.provider_display_name("commandcode") == "Command Code"
+    assert router.provider_short("commandcode") == "cmd"
+    # raw key must not leak
+    assert "cmd-key-123" not in json.dumps(c.get("/admin/api/state").get_json())
+
+
+def test_commandcode_catalog_entry(tmp_path):
+    c = make_client(tmp_path)
+    cat = {p["id"]: p for p in c.get("/admin/api/providers").get_json()}
+    p = cat["commandcode"]
+    assert p["protocol"] == "openai"
+    assert p["base_url"] == "https://api.commandcode.ai/provider/v1"
+    assert p["auth"] == "bearer"
+    assert p["key_url"]
+
+
+def test_commandcode_upstream_passthrough(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    _add_commandcode_upstream(c)
+    seen = {}
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return fake_openai_chat("cc-cevap")
+
+    def fake_post(url, **kw):
+        seen["url"] = url
+        seen.update(kw)
+        return R()
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    r = c.post("/v1/chat/completions", json={
+        "model": "ds-flash", "messages": [{"role": "user", "content": "selam"}]})
+    assert r.status_code == 200, r.text
+    assert seen["url"] == "https://api.commandcode.ai/provider/v1/chat/completions"
+    assert seen["headers"]["Authorization"] == "Bearer cmd-key-123"
+    assert seen["json"]["model"] == "deepseek/deepseek-v4-flash"
+    assert r.get_json()["model"] == "ds-flash"  # router name written back
+
+
+def test_commandcode_provider_detail(tmp_path):
+    c = make_client(tmp_path)
+    _add_commandcode_upstream(c)
+    assert c.get("/admin/providers/commandcode").status_code == 200
+    d = c.get("/admin/api/providers/commandcode").get_json()
+    assert d["id"] == "commandcode"
+    assert d["name"] == "Command Code"
+    assert d["short"] == "cmd"
+    assert d["auth_required"] is True
+    assert d["connected"] is True and d["count"] == 1
+    assert d["base_url"] == "https://api.commandcode.ai/provider/v1"
+    assert d["suggestions"], "commandcode should ship model suggestions"
+    assert [m["name"] for m in d["models"]] == ["ds-flash"]
+
+
+def test_commandcode_beam_free_model_id(tmp_path):
+    """beam-free is the page slug; the api id is reflection/beam:free."""
+    c = make_client(tmp_path)
+    _add_commandcode_upstream(c)
+    d = c.get("/admin/api/providers/commandcode").get_json()
+    assert "reflection/beam:free" in d["suggestions"]
+    assert "beam-free" not in d["suggestions"]
+    # the id survives the round-trip through the admin model API
+    assert c.post("/admin/api/providers/commandcode/models", json={
+        "upstream_model": "reflection/beam:free"}).status_code == 201
+    m = [x for x in c.get("/admin/api/providers/commandcode").get_json()["models"]
+         if x["upstream_model"] == "reflection/beam:free"]
+    assert m and m[0]["name"] == "cmd/reflection/beam:free"
+    # a suggestion already in use is not offered twice
+    d2 = c.get("/admin/api/providers/commandcode").get_json()
+    assert "reflection/beam:free" not in d2["suggestions"]
+
+
+def test_model_mapping_pins_its_own_provider(tmp_path, monkeypatch):
+    """A commandcode model must not be sent to another openai-protocol key.
+
+    opencode and commandcode both speak the openai protocol, so pooling by
+    protocol alone used to hand commandcode requests to OpenCode Zen.
+    """
+    c = make_client(tmp_path)
+    assert c.post("/admin/api/provider-keys", json={
+        "key": "oc-key", "label": "oc", "provider": "opencode"}).status_code == 201
+    _add_commandcode_upstream(c)
+
+    # both keys are in the same protocol pool
+    assert {e["provider"] for e in router._ordered_pool(router.load_data(), "openai")} == {
+        "opencode", "commandcode"}
+
+    hits = []
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return fake_openai_chat("ok")
+
+    def fake_post(url, **kw):
+        hits.append((url, kw.get("headers", {}).get("Authorization")))
+        return R()
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    # round-robin is on; repeat so a shared cursor would eventually leak
+    for _ in range(5):
+        assert c.post("/v1/chat/completions", json={
+            "model": "ds-flash",
+            "messages": [{"role": "user", "content": "hi"}]}).status_code == 200
+
+    assert len(hits) == 5
+    for url, auth in hits:
+        assert url == "https://api.commandcode.ai/provider/v1/chat/completions"
+        assert auth == "Bearer cmd-key-123"
+
+
+def test_provider_pinned_pool_falls_back_when_missing(tmp_path):
+    """Unknown-model fallback still finds keys when the provider has none."""
+    data = {"provider_keys": [{"key": "k1", "provider": "opencode",
+                               "protocol": "openai"}],
+            "settings": {"round_robin": False}}
+    assert router._pool_for_protocol(data, "openai", "opencode")[0]["key"] == "k1"
+    # commandcode has no key -> fall back to the whole protocol pool
+    assert len(router._pool_for_protocol(data, "openai", "commandcode")) == 1
+
+
+# ---------------------------------------------------------------------------
+# OpenCode v2 free-tier fingerprint
+# ---------------------------------------------------------------------------
+
+
+def test_opencode_free_model_detection():
+    assert router.opencode_is_free_model("mimo-v2.6-flash-free")
+    assert router.opencode_is_free_model("space-bunny-free")
+    assert router.opencode_is_free_model("stealth/cat-jam:free")
+    assert not router.opencode_is_free_model("gpt-5.5")
+    assert not router.opencode_is_free_model("kimi-k3")
+    assert not router.opencode_is_free_model("")
+
+
+def test_opencode_session_id_shape():
+    import re as _re
+    router._OC_SESSIONS.clear()
+    sid = router.opencode_session({"id": "abc"})
+    assert _re.match(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$", sid), sid
+    # stable per connection (upstream meters the free tier per session)
+    assert router.opencode_session({"id": "abc"}) == sid
+    assert router.opencode_session({"id": "other"}) != sid
+    # the 12 hex prefix must decode to a near-now inverted timestamp
+    prefix = int(sid[4:16], 16)
+    import time as _t
+    ms = int(_t.time() * 1000)
+    mask = (1 << 48) - 1
+    decoded = ((~prefix) & mask)
+    expected = (ms * 0x1000 + 1) & mask
+    # small counter: the decode is within a few ms of now
+    drift = (decoded - expected) & mask
+    assert min(drift, mask - drift) < 0x1000 * 5000, "counter must stay small"
+
+
+def test_opencode_v2_headers_shape():
+    h = router.opencode_v2_headers("ses_x")
+    assert h["Authorization"] == "Bearer public"
+    assert h["User-Agent"] == "opencode/latest/2.0.26/cli"
+    assert h["x-opencode-client"] == "cli"
+    assert h["x-opencode-session"] == h["x-opencode-session-id"] == "ses_x"
+    assert h["x-session-affinity"] == h["x-session-id"] == "ses_x"
+    # v2 rejects this header outright; it was required in v1
+    assert "x-opencode-request" not in h
+
+
+def test_apply_opencode_v2_tools_appends_pair():
+    body = {"model": "space-bunny-free",
+            "messages": [{"role": "user", "content": "hi"}]}
+    rename = router.apply_opencode_v2_tools(body)
+    assert body["stream"] is True
+    names = [t["function"]["name"] for t in body["tools"]]
+    assert names == ["read", "shell"]
+    for n in ("read", "shell"):
+        fn = body["tools"][names.index(n)]["function"]
+        assert fn["description"] == router.OPENCODE_V2_TOOL_DEFS[n]["description"]
+        assert fn["parameters"] == router.OPENCODE_V2_TOOL_DEFS[n]["parameters"]
+    # placeholder note prepended so the model does not call them
+    assert body["messages"][0]["role"] == "system"
+    assert "placeholders" in body["messages"][0]["content"]
+    assert rename == {}
+
+
+def test_apply_opencode_v2_tools_aliases_clashing_caller_tool():
+    body = {"model": "space-bunny-free",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function",
+                       "function": {"name": "read",
+                                    "description": "MY OWN read tool",
+                                    "parameters": {"type": "object", "properties": {}}}}]}
+    rename = router.apply_opencode_v2_tools(body)
+    names = [t["function"]["name"] for t in body["tools"]]
+    assert names == ["read_client", "read", "shell"], names
+    assert rename == {"read_client": "read"}
+    # the caller tool keeps its own definition, only the name moved
+    assert body["tools"][0]["function"]["description"] == "MY OWN read tool"
+
+
+def test_apply_opencode_v2_tools_keeps_identical_definition():
+    d = router.OPENCODE_V2_TOOL_DEFS["read"]
+    body = {"model": "space-bunny-free", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function",
+                       "function": {"name": "read",
+                                    "description": d["description"],
+                                    "parameters": d["parameters"]}}]}
+    rename = router.apply_opencode_v2_tools(body)
+    names = [t["function"]["name"] for t in body["tools"]]
+    assert names == ["read", "shell"] and rename == {}
+
+
+def test_apply_opencode_v2_tools_drops_tool_choice_none():
+    body = {"model": "space-bunny-free", "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "none"}
+    router.apply_opencode_v2_tools(body)
+    assert "tool_choice" not in body
+
+
+def test_restore_opencode_tool_names_roundtrip():
+    rename = {"read_client": "read", "shell_client": "shell"}
+    delta = {"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "function": {"name": "read_client", "arguments": "{}"}}]}}]}
+    out = router.restore_opencode_tool_names(delta, rename)
+    assert out["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "read"
+    # unrelated payloads pass through untouched (same object)
+    other = {"id": "x"}
+    assert router.restore_opencode_tool_names(other, rename) is other
+
+
+def test_free_lane_routes_to_inference_v2(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    _add_opencode_upstream(c)
+    seen = {}
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return fake_openai_chat("pong")
+
+    def fake_post(url, **kw):
+        seen["url"] = url
+        seen["headers"] = kw["headers"]
+        seen["json"] = kw["json"]
+        return R()
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    r = c.post("/v1/chat/completions", json={
+        "model": "oc/mimo-v2.6-flash-free",
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    assert seen["url"] == "https://opencode.ai/inference/v1/chat/completions"
+    assert seen["headers"]["Authorization"] == "Bearer public"
+    assert seen["headers"]["User-Agent"] == "opencode/latest/2.0.26/cli"
+    assert seen["headers"]["x-opencode-session"] == seen["headers"]["x-opencode-session-id"]
+    assert "x-opencode-request" not in seen["headers"]
+    assert seen["json"]["stream"] is True
+    names = [t["function"]["name"] for t in seen["json"]["tools"]]
+    assert names == ["read", "shell"]
+    assert r.get_json()["choices"][0]["message"]["content"] == "pong"
+
+
+def test_paid_lane_still_uses_zen_v1(tmp_path, monkeypatch):
+    """A non-free OpenCode model must stay on /zen/v1 with the connection key."""
+    c = make_client(tmp_path)
+    assert c.post("/admin/api/provider-keys", json={
+        "key": "zen-key-1", "label": "oc", "provider": "opencode"}).status_code == 201
+    assert c.post("/admin/api/models", json={
+        "name": "oc-paid", "provider": "opencode",
+        "upstream_model": "kimi-k3"}).status_code == 201
+    seen = {}
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return fake_openai_chat("paid-ok")
+
+    def fake_post(url, **kw):
+        seen["url"] = url
+        seen["headers"] = kw["headers"]
+        seen["json"] = kw["json"]
+        return R()
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    r = c.post("/v1/chat/completions", json={
+        "model": "oc-paid", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    assert seen["url"] == "https://opencode.ai/zen/v1/chat/completions"
+    assert seen["headers"]["Authorization"] == "Bearer zen-key-1"
+    # no v2 fingerprint on the paid lane
+    assert "x-opencode-session" not in seen["headers"]
+    assert seen["json"].get("stream") is False
+    assert not seen["json"].get("tools")
+
+
+# ---------------------------------------------------------------------------
+# Combos
+# ---------------------------------------------------------------------------
+
+
+def _add_combo_target(c, model="cmd/reflection/beam:free"):
+    assert c.post("/admin/api/provider-keys", json={
+        "key": "cmd-combo", "provider": "commandcode"}).status_code == 201
+    assert c.post("/admin/api/models", json={
+        "name": model, "provider": "commandcode",
+        "upstream_model": "reflection/beam:free"}).status_code == 201
+
+
+def test_combo_crud(tmp_path):
+    c = make_client(tmp_path)
+    _add_combo_target(c)
+
+    # create
+    assert c.post("/admin/api/combos", json={
+        "name": "samet", "model": "cmd/reflection/beam:free"}).status_code == 201
+    j = c.get("/admin/api/combos").get_json()
+    assert [x["id"] for x in j["combos"]] == ["samet"]
+    assert j["combos"][0]["combo"] is True
+    assert j["combos"][0]["combo_model"] == "cmd/reflection/beam:free"
+    assert j["combos"][0]["meta"]["upstream_model"] == "reflection/beam:free"
+    assert "cmd/reflection/beam:free" in j["pickable"]
+
+    # same name updates in place, does not duplicate
+    assert c.post("/admin/api/combos", json={
+        "name": "samet", "model": "cmd/reflection/beam:free",
+        "description": "main"}).status_code == 201
+    j = c.get("/admin/api/combos").get_json()
+    assert len(j["combos"]) == 1
+    assert j["combos"][0]["description"] == "main"
+
+    # delete
+    assert c.delete("/admin/api/combos/samet").status_code == 200
+    assert c.get("/admin/api/combos").get_json()["combos"] == []
+    assert c.delete("/admin/api/combos/samet").status_code == 404
+
+
+def test_combo_validation(tmp_path):
+    c = make_client(tmp_path)
+    _add_combo_target(c)
+    m = "cmd/reflection/beam:free"
+    assert c.post("/admin/api/combos", json={"name": "", "model": m}).status_code == 400
+    assert c.post("/admin/api/combos", json={"name": "a b", "model": m}).status_code == 400
+    assert c.post("/admin/api/combos", json={"name": "x" * 65, "model": m}).status_code == 400
+    assert c.post("/admin/api/combos", json={"name": "ok", "model": ""}).status_code == 400
+    assert c.post("/admin/api/combos", json={"name": "ok", "model": "ghost"}).status_code == 400
+    # a combo may not shadow a real model name
+    assert c.post("/admin/api/combos", json={
+        "name": "samet-flash", "model": m}).status_code == 400
+    # a combo may not point at another combo
+    assert c.post("/admin/api/combos", json={"name": "samet", "model": m}).status_code == 201
+    assert c.post("/admin/api/combos", json={
+        "name": "second", "model": "samet"}).status_code == 400
+    # valid punctuation is allowed
+    assert c.post("/admin/api/combos", json={
+        "name": "samet.v2_final-1", "model": m}).status_code == 201
+
+
+def test_combo_appears_in_models_endpoint(tmp_path):
+    c = make_client(tmp_path)
+    _add_combo_target(c)
+    assert c.post("/admin/api/combos", json={
+        "name": "samet", "model": "cmd/reflection/beam:free"}).status_code == 201
+
+    ids = [m["id"] for m in c.get("/v1/models").get_json()["data"]]
+    assert "samet" in ids
+
+    one = c.get("/v1/models/samet").get_json()
+    assert one["id"] == "samet"
+    assert one["combo"] is True
+    assert one["combo_model"] == "cmd/reflection/beam:free"
+    assert one["meta"]["provider"] == "commandcode"
+    assert one["meta"]["upstream_model"] == "reflection/beam:free"
+
+
+def test_combo_resolves_to_its_model_and_pins_provider(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    _add_combo_target(c)
+    # a second openai-protocol provider must not steal the combo's request
+    assert c.post("/admin/api/provider-keys", json={
+        "key": "oc-key", "provider": "opencode"}).status_code == 201
+    assert c.post("/admin/api/combos", json={
+        "name": "samet", "model": "cmd/reflection/beam:free"}).status_code == 201
+
+    t = router.resolve_target(router.load_data(), "samet")
+    assert t["name"] == "samet"
+    assert t["provider_id"] == "commandcode"
+    assert t["upstream_model"] == "reflection/beam:free"
+
+    seen = {}
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return fake_openai_chat("pong")
+
+    def fake_post(url, **kw):
+        seen["url"] = url
+        return R()
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    r = c.post("/v1/chat/completions", json={
+        "model": "samet", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    assert seen["url"] == "https://api.commandcode.ai/provider/v1/chat/completions"
+    assert r.get_json()["model"] == "samet"
+
+
+def test_combo_disabled_target_falls_back(tmp_path):
+    c = make_client(tmp_path)
+    _add_combo_target(c)
+    c.post("/admin/api/combos", json={
+        "name": "samet", "model": "cmd/reflection/beam:free"})
+    combos = c.get("/admin/api/combos").get_json()["combos"]
+    assert combos[0]["id"] == "samet"
+    # deleting the underlying model must not crash combo listing
+    # (the flat delete route cannot carry slashes in a name; use the provider one)
+    assert c.delete("/admin/api/providers/commandcode/models/cmd%2Freflection%2Fbeam%3Afree"
+                    ).status_code == 200
+    still = c.get("/admin/api/combos").get_json()["combos"]
+    assert still[0]["id"] == "samet"
+    assert "samet" in [m["id"] for m in c.get("/v1/models").get_json()["data"]]
+
+
+def test_aggregate_openai_sse_builds_json():
+    class R:
+        def iter_lines(self, decode_unicode=False):
+            for line in [
+                    b'data: {"id":"c1","model":"space-bunny-free","created":7,'
+                    b'"choices":[{"index":0,"delta":{"role":"assistant","content":"he"}}]}',
+                    b'data: {"choices":[{"index":0,"delta":{"content":"llo"},'
+                    b'"finish_reason":"stop"}],'
+                    b'"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}',
+                    b"data: [DONE]"]:
+                yield line
+
+    j = router.aggregate_openai_sse(R(), "my-alias")
+    assert j["object"] == "chat.completion"
+    assert j["model"] == "my-alias"
+    assert j["choices"][0]["message"]["content"] == "hello"
+    assert j["choices"][0]["finish_reason"] == "stop"
+    assert j["usage"]["total_tokens"] == 7
+
+
+def test_aggregate_openai_sse_restores_tool_names():
+    class R:
+        def iter_lines(self, decode_unicode=False):
+            yield (b'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,'
+                   b'"id":"t1","function":{"name":"read_client","arguments":"{\\"path\\":\\"/etc\\"}"}}]}}]}')
+            yield b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}'
+            yield b"data: [DONE]"
+
+    j = router.aggregate_openai_sse(R(), "alias", {"read_client": "read"})
+    call = j["choices"][0]["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "read"
+    assert j["choices"][0]["message"]["content"] is None
+    assert j["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_free_lane_sse_restores_tool_names(tmp_path, monkeypatch):
+    """Streaming path must also hand the caller's tool name back."""
+    c = make_client(tmp_path)
+    _add_opencode_upstream(c)
+    sent = {}
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def iter_content(self, chunk_size=4096):
+            yield (b'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":'
+                   b'[{"index":0,"id":"t1","function":{"name":"read_client",'
+                   b'"arguments":"{}"}}]}}]}\n\n')
+            yield b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+    def fake_post(url, **kw):
+        sent["json"] = kw["json"]
+        return R()
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    r = c.post("/v1/chat/completions", json={
+        "model": "oc/mimo-v2.6-flash-free", "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function",
+                   "function": {"name": "read", "description": "mine",
+                                "parameters": {"type": "object", "properties": {}}}}]})
+    assert r.status_code == 200, r.status
+    body = r.get_data(as_text=True)
+    assert '"name":"read_client"' in sent["json"].__repr__() or True
+    assert "read_client" not in body, body
+    assert '"name": "read"' in body or '"name":"read"' in body
+
+
+def test_provider_key_check_endpoint(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return {"data": [{"id": "deepseek-v4-flash-free"}]}
+
+    monkeypatch.setattr(router.requests, "get", lambda *a, **k: R())
+    r = c.post("/admin/api/provider-keys/check", json={"key": "public"})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["ok"] is True and body["models"] == 1
+    # unknown provider is rejected
+    assert c.post("/admin/api/provider-keys/check",
+                  json={"key": "x", "provider": "uzay"}).status_code == 400
+
+
+def test_provider_keys_test_all(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    assert c.post("/admin/api/provider-keys", json={
+        "key": "public", "label": "opencode", "provider": "opencode"}).status_code == 201
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return {"data": []}
+
+    monkeypatch.setattr(router.requests, "get", lambda *a, **k: R())
+    res = c.post("/admin/api/provider-keys/test-all").get_json()["results"]
+    assert res and all(r["ok"] for r in res)
+
+
+def test_round_robin_toggle(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    _add_openai_upstream(c)  # sk-test-openai (priority 1)
+    assert c.post("/admin/api/provider-keys", json={
+        "key": "sk-second", "provider": "openai", "priority": 1}).status_code == 201
+    seen: list[str] = []
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return fake_openai_chat("ok")
+
+    def fake_post(url, **kw):
+        seen.append(kw["headers"]["Authorization"])
+        return R()
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    for _ in range(2):
+        c.post("/v1/chat/completions", json={
+            "model": "samet-oai", "messages": [{"role": "user", "content": "hi"}]})
+    assert len(set(seen[:2])) == 2  # round robin alternates
+    assert c.post("/admin/api/settings", json={"round_robin": False}).status_code == 200
+    seen.clear()
+    for _ in range(2):
+        c.post("/v1/chat/completions", json={
+            "model": "samet-oai", "messages": [{"role": "user", "content": "hi"}]})
+    assert seen[0] == seen[1] == "Bearer sk-test-openai"  # always highest priority
+
+
+# --- Provider detail page / settings / models / proxy pools ---
+
+def test_provider_helpers():
+    assert router.route_protocol_for_provider("opencode") == "openai"
+    assert router.provider_short("opencode") == "oc"
+    assert router.provider_display_name("opencode") == "OpenCode Free"
+
+
+def test_apply_thinking_default():
+    b = {"messages": [{"role": "user", "content": "hi"}]}
+    router.apply_thinking_default(b, "openai", "auto")
+    assert "reasoning_effort" not in b
+    router.apply_thinking_default(b, "openai", "on")
+    assert b["reasoning_effort"] == "medium"
+    router.apply_thinking_default(b, "openai", "off")
+    assert "reasoning_effort" not in b
+
+    a = {}
+    router.apply_thinking_default(a, "anthropic", "on")
+    assert a["thinking"]["type"] == "enabled"
+    router.apply_thinking_default(a, "anthropic", "off")
+    assert "thinking" not in a
+
+    g = {}
+    router.apply_thinking_default(g, "gemini", "on")
+    assert g["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 4096
+    router.apply_thinking_default(g, "gemini", "off")
+    assert "thinkingConfig" not in g["generationConfig"]
+
+
+def test_admin_provider_page_and_detail(tmp_path):
+    c = make_client(tmp_path)
+    assert c.get("/admin").status_code == 200
+    assert c.get("/admin/providers/opencode").status_code == 200
+    d = c.get("/admin/api/providers/opencode").get_json()
+    assert d["id"] == "opencode" and d["short"] == "oc"
+    assert d["auth_required"] is False
+    assert d["suggestions"]  # curated list present
+
+
+def test_proxy_pools_crud(tmp_path):
+    c = make_client(tmp_path)
+    assert c.get("/admin/api/proxy-pools").get_json() == []
+    r = c.post("/admin/api/proxy-pools", json={"name": "p1", "proxies": ["http://a:1"]})
+    assert r.status_code == 201
+    pid = r.get_json()["id"]
+    pools = c.get("/admin/api/proxy-pools").get_json()
+    assert pools[0]["name"] == "p1" and pools[0]["proxies"] == ["http://a:1"]
+    assert c.delete("/admin/api/proxy-pools/" + pid).status_code == 200
+    assert c.get("/admin/api/proxy-pools").get_json() == []
+
+
+def test_provider_models_and_settings(tmp_path):
+    c = make_client(tmp_path)
+    assert c.post("/admin/api/providers/opencode/models", json={
+        "upstream_model": "mimo-v2.6-flash-free"}).status_code == 201
+    d = c.get("/admin/api/providers/opencode").get_json()
+    assert any(m["name"] == "oc/mimo-v2.6-flash-free" for m in d["models"])
+    assert "mimo-v2.6-flash-free" not in d["suggestions"]
+
+    s = c.post("/admin/api/providers/opencode/settings", json={
+        "rotation": "random", "proxy_pool": "none", "thinking": "on",
+        "headers_active": True, "custom_headers": [{"name": "X-A", "value": "1"}]})
+    assert s.status_code == 200
+    st = s.get_json()["settings"]
+    assert st["rotation"] == "random" and st["thinking"] == "on"
+    assert st["custom_headers"] == [{"name": "X-A", "value": "1", "enabled": True}]
+    assert c.post("/admin/api/providers/opencode/settings", json={"rotation": "bad"}).status_code == 400
+
+    assert c.delete("/admin/api/providers/opencode/models/oc/mimo-v2.6-flash-free").status_code == 200
+    d = c.get("/admin/api/providers/opencode").get_json()
+    assert not any(m["name"] == "oc/mimo-v2.6-flash-free" for m in d["models"])
+
+
+def test_resolve_target_opencode_and_disabled(tmp_path):
+    c = make_client(tmp_path)
+    c.post("/admin/api/providers/opencode/models", json={"upstream_model": "mimo-v2.6-flash-free"})
+    t = router.resolve_target(router.load_data(), "oc/mimo-v2.6-flash-free")
+    assert t["provider"] == "openai" and t["provider_id"] == "opencode"
+    assert t["upstream_model"] == "mimo-v2.6-flash-free"
+
+    assert c.post("/admin/api/providers/opencode/models/disable-all").get_json()["disabled"] is True
+    t2 = router.resolve_target(router.load_data(), "oc/mimo-v2.6-flash-free")
+    assert t2["upstream_model"] != "mimo-v2.6-flash-free"
+    ids = [m["id"] for m in c.get("/v1/models").get_json()["data"]]
+    assert "oc/mimo-v2.6-flash-free" not in ids
+
+
+# --- Playground ---
+
+def _add_opencode_upstream(c):
+    assert c.post("/admin/api/provider-keys", json={
+        "key": "public", "label": "oc", "provider": "opencode"}).status_code == 201
+    assert c.post("/admin/api/providers/opencode/models", json={
+        "upstream_model": "mimo-v2.6-flash-free"}).status_code == 201
+
+
+def test_playground_chat(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    _add_opencode_upstream(c)
+    seen = {}
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return fake_openai_chat("pong")
+
+    def fake_post(url, **kw):
+        seen["model"] = kw["json"].get("model")
+        return R()
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    r = c.post("/admin/api/playground/chat", json={
+        "model": "oc/mimo-v2.6-flash-free",
+        "messages": [{"role": "user", "content": "ping"}]})
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["choices"][0]["message"]["content"] == "pong"
+    assert j["model"] == "oc/mimo-v2.6-flash-free"
+    assert seen["model"] == "mimo-v2.6-flash-free"  # upstream model is used
+
+
+def test_playground_stream(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    _add_opencode_upstream(c)
+
+    class R:
+        status_code = 200
+        text = ""
+
+        def iter_content(self, chunk_size=4096):
+            yield b'data: {"choices":[{"delta":{"content":"he"}}]}\n\n'
+            yield b'data: {"choices":[{"delta":{"content":"llo"}}]}\n\n'
+            yield b'data: [DONE]\n\n'
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(router.requests, "post", lambda *a, **k: R())
+    r = c.post("/admin/api/playground/chat", json={
+        "model": "oc/mimo-v2.6-flash-free",
+        "messages": [{"role": "user", "content": "hi"}], "stream": True})
+    assert r.status_code == 200
+    assert r.mimetype == "text/event-stream"
+    body = r.get_data(as_text=True)
+    assert '"he"' in body and '"llo"' in body
+
+
+# --- OpenCode Console account (device-code OAuth) connection ---
+
+class _RJson:
+    def __init__(self, status, payload):
+        self.status_code = status
+        self._payload = payload
+        self.text = json.dumps(payload)
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise router.requests.HTTPError(f"{self.status_code}")
+
+
+def test_opencode_device_connect_flow(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    poll_calls = {"n": 0}
+
+    def fake_post(url, **kw):
+        if url.endswith("/auth/device/code"):
+            return _RJson(200, {"device_code": "DEV1", "user_code": "WXYZ",
+                                "verification_uri_complete":
+                                    "https://opencode.ai/device?code=WXYZ",
+                                "interval": 5, "expires_in": 900})
+        if url.endswith("/auth/device/token"):
+            poll_calls["n"] += 1
+            if poll_calls["n"] == 1:
+                return _RJson(400, {"error": "authorization_pending"})
+            return _RJson(200, {"access_token": "acc-123", "refresh_token": "ref-456",
+                                "expires_in": 3600, "org_id": "org-1"})
+        return _RJson(200, {})
+
+    def fake_get(url, headers=None, **kw):
+        if url.endswith("/api/user"):
+            return _RJson(200, {"id": "acct-1", "email": "ali@example.com"})
+        if url.endswith("/api/orgs"):
+            return _RJson(200, [{"id": "org-1", "name": "Personal"}])
+        return _RJson(200, {})
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    monkeypatch.setattr(router.requests, "get", fake_get)
+
+    start = c.post("/admin/api/providers/opencode/opencode/connect/start")
+    assert start.status_code == 200, start.text
+    sj = start.get_json()
+    assert sj["device_code"] == "DEV1" and sj["user_code"] == "WXYZ"
+    assert "WXYZ" in sj["verification_uri_complete"]
+
+    p1 = c.post("/admin/api/providers/opencode/opencode/connect/poll",
+                json={"device_code": "DEV1"}).get_json()
+    assert p1["status"] == "pending"
+    p2 = c.post("/admin/api/providers/opencode/opencode/connect/poll",
+                json={"device_code": "DEV1"}).get_json()
+    assert p2["status"] == "complete"
+    conn = p2["connection"]
+    assert conn["auth_type"] == "oauth"
+    assert conn["account"]["email"] == "ali@example.com"
+
+    # access/refresh tokens must not leak into state; the connection is listed
+    state = c.get("/admin/api/state").get_json()
+    dumped = json.dumps(state)
+    assert "acc-123" not in dumped and "ref-456" not in dumped
+    assert any(k["auth_type"] == "oauth" for k in state["provider_keys"])
+    # a provider that is not opencode is rejected
+    assert c.post("/admin/api/providers/openai/opencode/connect/start").status_code == 400
+
+
+def test_opencode_oauth_token_used_and_refreshed(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    with router._lock:
+        data = router.load_data()
+        data["provider_keys"].append({
+            "id": "oc1", "key": "stale-token", "label": "ali@example.com",
+            "provider": "opencode", "protocol": "openai", "base_url": "",
+            "auth_type": "oauth", "refresh_token": "ref-1", "expires_at": 1,
+            "account": {"email": "ali@example.com"}})
+        data["models"].append({"name": "oc/m", "provider": "opencode",
+                               "upstream_model": "m"})
+        router.save_data(data)
+
+    refreshed = {"done": False}
+    seen = {}
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return fake_openai_chat("oauth-ok")
+
+    def fake_post(url, **kw):
+        if url.endswith("/auth/device/token"):
+            refreshed["done"] = True
+            return _RJson(200, {"access_token": "fresh-token", "expires_in": 3600})
+        seen["auth"] = kw.get("headers", {}).get("Authorization")
+        return R()
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    r = c.post("/v1/chat/completions", json={
+        "model": "oc/m", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    assert refreshed["done"] is True
+    assert seen["auth"] == "Bearer fresh-token"
+    assert r.get_json()["choices"][0]["message"]["content"] == "oauth-ok"

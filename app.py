@@ -35,6 +35,8 @@ Admin API:
   GET    /admin/api/providers                      -> provider catalog (protocol/base_url defaults)
   POST   /admin/api/provider-keys {key,label,provider,protocol?,base_url?}
   DELETE /admin/api/provider-keys/<id>
+  POST   /admin/api/providers/opencode/opencode/connect/start  -> device-code login
+  POST   /admin/api/providers/opencode/opencode/connect/poll   -> device-code poll
 """
 
 from __future__ import annotations
@@ -42,6 +44,9 @@ from __future__ import annotations
 import base64
 import json
 import os
+import random
+import re
+import secrets
 import threading
 import time
 import uuid
@@ -58,18 +63,43 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com"
 OPENAI_BASE = "https://api.openai.com/v1"
 ANTHROPIC_BASE = "https://api.anthropic.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
+COMMANDCODE_BASE = "https://api.commandcode.ai/provider/v1"
 
-PROVIDERS = ("openai", "anthropic", "gemini", "custom")
+PROVIDERS = ("opencode", "openai", "anthropic", "gemini", "commandcode", "custom")
 PROTOCOLS = ("openai", "anthropic", "gemini")
+OPENCODE_BASE = "https://opencode.ai/zen/v1"
+# Since OpenCode v2 (2026-10-14) the keyless free tier moved off /zen/v1 to
+# /inference/v1 and only accepts the v2 client fingerprint. Paid/keyed Zen
+# requests still use OPENCODE_BASE - see opencode_is_free_model().
+OPENCODE_INFERENCE_BASE = "https://opencode.ai/inference/v1"
+OPENCODE_V2_UA = "opencode/latest/2.0.26/cli"
+OPENCODE_V2_CLIENT = "cli"
+OPENCODE_V2_PROJECT = "global"
+# v2 rejects x-opencode-request (v1 required it), so we never send it.
+OPENCODE_FINGERPRINT_TOOLS = ("read", "shell")
+# OpenCode Console account login (device-code OAuth), mirrors opencode's CLI flow:
+#   POST {console}/auth/device/code  -> {device_code, user_code, verification_uri_complete, interval}
+#   POST {console}/auth/device/token (device_code / refresh_token grant) -> tokens
+OPENCODE_CONSOLE = "https://opencode.ai/console"
+OPENCODE_CLIENT_ID = "opencode-cli"
+OPENCODE_DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+OPENCODE_UA = "opencode-cli/1.0 (+samet-router)"
 
 # provider -> defaults (protocol, base_url, auth scheme)
 PROVIDER_DEFAULTS: dict[str, dict] = {
+    "opencode": {"protocol": "openai", "base_url": OPENCODE_BASE, "auth": "bearer",
+                 "key_hint": "public or sk-...", "key_url": "https://opencode.ai/auth"},
     "openai": {"protocol": "openai", "base_url": OPENAI_BASE, "auth": "bearer",
                "key_hint": "sk-...", "key_url": "https://platform.openai.com/api-keys"},
     "anthropic": {"protocol": "anthropic", "base_url": ANTHROPIC_BASE, "auth": "x-api-key",
                   "key_hint": "sk-ant-...", "key_url": "https://console.anthropic.com/"},
     "gemini": {"protocol": "gemini", "base_url": GEMINI_BASE, "auth": "query",
                "key_hint": "AIza...", "key_url": "https://aistudio.google.com/apikey"},
+    # Command Code Provider API: one base, /chat/completions + /messages + /models.
+    # Routed on the openai protocol, so Claude models (which are /messages-only) are out.
+    "commandcode": {"protocol": "openai", "base_url": COMMANDCODE_BASE, "auth": "bearer",
+                    "key_hint": "Command Code API key",
+                    "key_url": "https://commandcode.ai/settings/keys"},
     "custom": {"protocol": "openai", "base_url": "", "auth": "bearer",
                "key_hint": "server key", "key_url": ""},
 }
@@ -92,6 +122,7 @@ def default_data() -> dict:
         # base_url: if empty, the provider default is used
         "provider_keys": [],
         "router_keys": [],  # user API keys [{id, key, prefix, label, created_at, last_used_at, request_count}]
+        "combos": [],  # [{id, name, model, description, created_at}] - name -> one existing model
         "models": [  # router model name -> {provider, upstream_model}
             {"name": "samet-flash", "provider": "gemini", "upstream_model": "gemini-2.0-flash",
              "description": "Default fast model"},
@@ -100,7 +131,10 @@ def default_data() -> dict:
         ],
         "logs": [],  # [{ts, endpoint, model, provider, thinking, ok, latency_ms, error, ...}]
         "provider_index": {},  # provider -> round-robin order
-        "settings": {"default_system": ""},
+        "proxy_pools": [],  # [{id, name, proxies: ["http://user:pass@host:port"], created_at}]
+        "proxy_index": {},  # rotation cursor per provider/pool
+        "provider_settings": {},  # provider -> {proxy_pool, rotation, thinking, headers_active, custom_headers: []}
+        "settings": {"default_system": "", "round_robin": True},
         # cumulative counters (unaffected by log rotation)
         "stats": {"total_requests": 0, "ok": 0, "err": 0,
                   "input_tokens": 0, "output_tokens": 0},
@@ -122,14 +156,21 @@ def load_data() -> dict:
         data.setdefault(k, v)
     # also migrate the settings content
     if not isinstance(data.get("settings"), dict):
-        data["settings"] = {"default_system": ""}
+        data["settings"] = {"default_system": "", "round_robin": True}
     data["settings"].setdefault("default_system", "")
+    data["settings"].setdefault("round_robin", True)
     if not isinstance(data.get("router_keys"), list):
         data["router_keys"] = []
     if not isinstance(data.get("provider_keys"), list):
         data["provider_keys"] = []
     if not isinstance(data.get("provider_index"), dict):
         data["provider_index"] = {}
+    if not isinstance(data.get("proxy_pools"), list):
+        data["proxy_pools"] = []
+    if not isinstance(data.get("proxy_index"), dict):
+        data["proxy_index"] = {}
+    if not isinstance(data.get("provider_settings"), dict):
+        data["provider_settings"] = {}
     # --- legacy migration: gemini_keys -> provider_keys ---
     old_gemini = data.pop("gemini_keys", None)
     if old_gemini:
@@ -180,6 +221,62 @@ def provider_catalog() -> list[dict]:
         out.append({"id": pid, "protocol": d["protocol"], "base_url": d["base_url"],
                     "auth": d["auth"], "key_hint": d["key_hint"], "key_url": d["key_url"]})
     return out
+
+
+PROVIDER_DISPLAY = {"opencode": "OpenCode Free", "commandcode": "Command Code"}
+PROVIDER_SHORT = {"opencode": "oc", "openai": "oai", "anthropic": "ant",
+                  "gemini": "gem", "commandcode": "cmd"}
+
+# curated free OpenCode Zen models (shown as suggestions on the provider page)
+OPENCODE_SUGGESTIONS = [
+    "big-pickle", "beam-free", "mimo-v2.6-flash-free",
+    "nemotron-3.5-super-v1-free", "nemotron-3.5-lightning-free",
+    "longcat-2.5-preview-free", "deepseek-v4.1-flash-free",
+]
+
+# Command Code models that answer on /chat/completions (Claude is /messages-only)
+# Note: the model page slug (commandcode.ai/models/beam-free) is NOT the api id;
+# the api id for Beam 1.0 is "reflection/beam:free".
+COMMANDCODE_SUGGESTIONS = [
+    "reflection/beam:free",
+    "deepseek/deepseek-v4-flash", "moonshotai/Kimi-K2.7-Code",
+    "z-ai/glm-5.3-flashx", "Qwen/Qwen3.8-Max", "xiaomi/mimo-v2.6-pro",
+    "google/gemini-3.8-flash", "gpt-5.5", "MiniMaxAI/MiniMax-M3",
+]
+PROVIDER_SUGGESTIONS = {"opencode": OPENCODE_SUGGESTIONS,
+                        "commandcode": COMMANDCODE_SUGGESTIONS}
+
+DEFAULT_PROVIDER_SETTINGS = {
+    "proxy_pool": "none",       # proxy pool id or "none" (direct)
+    "rotation": "none",         # none | round_robin | random
+    "thinking": "auto",         # auto | on | off
+    "headers_active": False,
+    "custom_headers": [],       # [{name, value, enabled}]
+}
+
+
+def provider_display_name(provider: str) -> str:
+    provider = (provider or "").strip().lower()
+    return PROVIDER_DISPLAY.get(provider, provider.capitalize() or provider)
+
+
+def provider_short(provider: str) -> str:
+    provider = (provider or "").strip().lower()
+    return PROVIDER_SHORT.get(provider, provider[:3] or "m")
+
+
+def route_protocol_for_provider(provider: str) -> str:
+    """Map a provider id to the protocol used for routing (opencode -> openai)."""
+    provider = (provider or "").strip().lower()
+    return PROVIDER_DEFAULTS.get(provider, PROVIDER_DEFAULTS["gemini"])["protocol"]
+
+
+def get_provider_settings(data: dict, provider: str) -> dict:
+    stored = (data.get("provider_settings", {}) or {}).get(provider, {}) or {}
+    merged = {**DEFAULT_PROVIDER_SETTINGS, **stored}
+    if not isinstance(merged.get("custom_headers"), list):
+        merged["custom_headers"] = []
+    return merged
 
 
 def normalize_provider_key(provider: str, protocol: str | None, base_url: str | None) -> tuple[str, str]:
@@ -755,6 +852,44 @@ def budget_for_effort(effort, default: int = 4096) -> int:
     if isinstance(effort, str) and effort.strip().lower() in EFFORT_BUDGET:
         return EFFORT_BUDGET[effort.strip().lower()]
     return default
+
+
+def apply_thinking_default(body: dict, protocol: str, mode: str) -> None:
+    """Mutate `body` to honor a provider-level thinking default (in place).
+
+    mode: "auto" (leave as-is) | "on" (enable if the client did not) |
+    "off" (force disable).
+    """
+    mode = (mode or "auto").strip().lower()
+    if mode == "auto" or not isinstance(body, dict):
+        return
+    if protocol == "openai":
+        if mode == "on":
+            if not body.get("reasoning_effort"):
+                body["reasoning_effort"] = "medium"
+        else:
+            body.pop("reasoning_effort", None)
+            body.pop("reasoning", None)
+            for m in body.get("messages", []) or []:
+                if isinstance(m, dict):
+                    m.pop("reasoning_content", None)
+    elif protocol == "anthropic":
+        t = body.get("thinking")
+        if mode == "on":
+            if not (isinstance(t, dict) and t.get("type") == "enabled"):
+                body["thinking"] = {"type": "enabled", "budget_tokens": 4096}
+        else:
+            body.pop("thinking", None)
+    else:  # gemini
+        gc = body.get("generationConfig")
+        if mode == "on":
+            if not isinstance(gc, dict):
+                gc = {}
+                body["generationConfig"] = gc
+            if not gc.get("thinkingConfig"):
+                gc["thinkingConfig"] = {"thinkingBudget": 4096, "includeThoughts": True}
+        elif isinstance(gc, dict):
+            gc.pop("thinkingConfig", None)
 
 
 def effort_for_budget(n) -> str:
@@ -1545,35 +1680,58 @@ def anthropic_response_to_gemini(anth: dict) -> dict:
                               "totalTokenCount": inp + out}}
 
 
+COMBO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def list_combos(data: dict) -> list[dict]:
+    """Enabled combos, oldest first."""
+    return [c for c in (data.get("combos") or [])
+            if isinstance(c, dict) and str(c.get("name") or "").strip()]
+
+
+def find_combo(data: dict, name: str) -> dict | None:
+    name = str(name or "").strip()
+    if not name:
+        return None
+    for c in list_combos(data):
+        if str(c.get("name") or "").strip() == name:
+            return c
+    return None
+
+
 def resolve_target(data: dict, router_model: str) -> dict:
     """Resolve a router alias to its target -> {name, provider, upstream_model}.
 
     An unknown name starting with gemini-* passes through as-is (passthrough); in
     other cases it falls back to the first model (legacy claude-* fallback behavior).
+    Combo names are resolved first: they alias exactly one existing model.
     """
     router_model = (router_model or "").strip() or "samet-flash"
-    models = [m for m in data.get("models", []) if isinstance(m, dict)]
+    combo = find_combo(data, router_model)
+    if combo and combo.get("model"):
+        inner = resolve_target(data, str(combo["model"]))
+        return {**inner, "name": router_model, "combo_model": str(combo["model"])}
+    models = [m for m in data.get("models", [])
+              if isinstance(m, dict) and not m.get("disabled")]
     for m in models:
         if m.get("name") == router_model:
-            provider = m.get("provider") or "gemini"
-            if provider not in ("openai", "anthropic", "gemini"):
-                provider = "gemini"
+            provider = route_protocol_for_provider(m.get("provider") or "gemini")
             upstream = m.get("upstream_model") or m.get("gemini_model") or router_model
             return {"name": m["name"], "provider": provider,
+                    "provider_id": m.get("provider") or "gemini",
                     "upstream_model": str(upstream)}
     low = router_model.lower()
     if low.startswith("gemini-") or low.startswith("gemma-") or low.startswith("models/"):
-        return {"name": router_model, "provider": "gemini",
+        return {"name": router_model, "provider": "gemini", "provider_id": "gemini",
                 "upstream_model": router_model.replace("models/", "")}
     if models:
         m0 = models[0]
-        provider = m0.get("provider") or "gemini"
-        if provider not in ("openai", "anthropic", "gemini"):
-            provider = "gemini"
+        provider = route_protocol_for_provider(m0.get("provider") or "gemini")
         return {"name": router_model, "provider": provider,
+                "provider_id": m0.get("provider") or "gemini",
                 "upstream_model": str(m0.get("upstream_model") or m0.get("gemini_model")
                                       or "gemini-2.0-flash")}
-    return {"name": router_model, "provider": "gemini",
+    return {"name": router_model, "provider": "gemini", "provider_id": "gemini",
             "upstream_model": "gemini-2.0-flash"}
 
 
@@ -1878,28 +2036,54 @@ def iter_openai_sse(oai_resp: dict):
 # Upstream call layer (protocol + base_url + key rotation)
 # ---------------------------------------------------------------------------
 
-def _pool_for_protocol(data: dict, protocol: str) -> list[dict]:
-    """Keys speaking the given protocol (including custom)."""
-    return [k for k in data.get("provider_keys", [])
+def _pool_for_protocol(data: dict, protocol: str, provider: str = "") -> list[dict]:
+    """Keys speaking the given protocol (including custom).
+
+    When `provider` is given the pool is narrowed to that provider, so a model
+    mapped to e.g. commandcode is not sent to another openai-protocol vendor.
+    Falls back to every key on that protocol if the provider has none, which
+    keeps resolve_target()'s unknown-model fallback working.
+    """
+    keys = [k for k in data.get("provider_keys", [])
             if isinstance(k, dict) and k.get("key")
             and effective_protocol(k) == protocol]
+    provider = (provider or "").strip().lower()
+    if provider:
+        pinned = [k for k in keys if (k.get("provider") or "") == provider]
+        if pinned:
+            return pinned
+    return keys
 
 
-def _ordered_pool(data: dict, protocol: str) -> list[dict]:
-    pool = _pool_for_protocol(data, protocol)
+def _ordered_pool(data: dict, protocol: str, provider: str = "") -> list[dict]:
+    pool = _pool_for_protocol(data, protocol, provider)
     if not pool:
+        scope = f" for provider {provider}" if provider else ""
         raise RuntimeError(
-            f"No provider key configured for protocol {protocol}. "
+            f"No provider key configured for protocol {protocol}{scope}. "
             "Add one in /admin first.")
-    start = int((data.get("provider_index", {}) or {}).get(protocol, 0) or 0) % len(pool)
+    # lower priority number = tried first (1 is highest priority)
+    pool = sorted(pool, key=lambda k: int(k.get("priority", 1) or 1))
+    round_robin = bool((data.get("settings", {}) or {}).get("round_robin", True))
+    if not round_robin:
+        return pool
+    cursor = pool_cursor(protocol, provider)
+    start = int((data.get("provider_index", {}) or {}).get(cursor, 0) or 0) % len(pool)
     return pool[start:] + pool[:start]
 
 
-def _advance_provider_index(protocol: str, nkeys: int) -> None:
+def pool_cursor(protocol: str, provider: str = "") -> str:
+    """provider_index key: per-provider when pinned, else shared per protocol."""
+    provider = (provider or "").strip().lower()
+    return f"{protocol}:{provider}" if provider else protocol
+
+
+def _advance_provider_index(protocol: str, nkeys: int, provider: str = "") -> None:
     with _lock:
         data = load_data()
         idx = data.setdefault("provider_index", {})
-        idx[protocol] = (int(idx.get(protocol, 0) or 0) + 1) % max(nkeys, 1)
+        cur = pool_cursor(protocol, provider)
+        idx[cur] = (int(idx.get(cur, 0) or 0) + 1) % max(nkeys, 1)
         save_data(data)
 
 
@@ -1933,6 +2117,610 @@ def upstream_headers(protocol: str, api_key: str, extra: dict | None = None) -> 
     return h
 
 
+def _proxy_dict(proxy: str | None):
+    proxy = (proxy or "").strip()
+    return {"http": proxy, "https": proxy} if proxy else None
+
+
+def _pick_proxy(data: dict, provider: str) -> str | None:
+    """Select an outbound proxy for a provider (rotation aware).
+
+    Mutates `data["proxy_index"]`; the caller persists it. `rotation`:
+    none (single selected pool, round-robin within it) | round_robin
+    (rotate across all pools) | random.
+    """
+    settings = get_provider_settings(data, provider)
+    pools = [p for p in data.get("proxy_pools", []) if isinstance(p, dict)]
+    pool_map = {p.get("id"): p for p in pools}
+    rotation = str(settings.get("rotation") or "none").lower()
+    index = data.setdefault("proxy_index", {})
+    if rotation in ("round_robin", "random") and pools:
+        entries = [str(px).strip() for p in pools
+                   for px in (p.get("proxies") or []) if str(px).strip()]
+        if not entries:
+            return None
+        if rotation == "random":
+            return entries[random.randrange(len(entries))]
+        key = f"rot:{provider}"
+        i = int(index.get(key, 0) or 0) % len(entries)
+        index[key] = i + 1
+        return entries[i]
+    pool = pool_map.get(str(settings.get("proxy_pool") or "none"))
+    if not pool:
+        return None
+    proxies = [str(px).strip() for px in (pool.get("proxies") or []) if str(px).strip()]
+    if not proxies:
+        return None
+    key = f"pool:{pool.get('id')}"
+    i = int(index.get(key, 0) or 0) % len(proxies)
+    index[key] = i + 1
+    return proxies[i]
+
+
+def provider_custom_headers(data: dict, provider: str) -> dict:
+    """Active custom headers for a provider (applied to upstream requests)."""
+    settings = get_provider_settings(data, provider)
+    if not settings.get("headers_active"):
+        return {}
+    out: dict = {}
+    for h in settings.get("custom_headers") or []:
+        if isinstance(h, dict) and h.get("enabled", True) and str(h.get("name", "")).strip():
+            out[str(h["name"]).strip()] = str(h.get("value", ""))
+    return out
+
+
+def _opencode_console_headers(token: str | None = None, extra: dict | None = None) -> dict:
+    h: dict = {"Content-Type": "application/json", "Accept": "application/json",
+               "User-Agent": OPENCODE_UA}
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    if extra:
+        h.update({k: v for k, v in extra.items() if v})
+    return h
+
+
+# ---------------------------------------------------------------------------
+# OpenCode v2 free-tier fingerprint (keyless /inference/v1 lane)
+# ---------------------------------------------------------------------------
+# Upstream compares description AND parameters byte-for-byte against the v2 CLI,
+# so do not reword, reorder or reformat these two definitions.
+OPENCODE_V2_TOOL_DEFS: dict[str, dict] = {
+    "read": {
+        "description": (
+            "Read the contents of a file or directory. Supports text files, images, and PDFs. "
+            "Images and PDFs are presented directly to the model. Each text line is prefixed by "
+            "its 1-based line number as <line>: <content>. The prefix is for reference and is not "
+            "part of the file content. Directory entries are returned one per line. Use offset and "
+            "limit to read large files or directories in sections. Prefer one larger read over many "
+            "small slices, and use grep to find specific content in large files."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File or directory to read"},
+                "offset": {"type": "integer", "minimum": 0,
+                           "description": "The line or directory entry to start reading from (1-based)"},
+                "limit": {"type": "integer", "minimum": 0,
+                          "description": "The maximum number of lines or directory entries to read "
+                                         "(defaults to and capped at 2000)"},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+    "shell": {
+        "description": (
+            "Execute a shell command and return its output. Commands run on Linux using bash. "
+            "Quote file paths containing spaces or special characters. Prefer dedicated tools over "
+            "shell commands when possible. When output is large, the full result is saved to a file "
+            "and a truncated preview is returned. Rely on automatic truncation unless filtering the "
+            "output is more useful. Commands accept an optional timeout, background commands have no "
+            "timeout by default. Background commands return immediately, and you will be notified "
+            "when they complete."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Shell command string to execute"},
+                "workdir": {"type": "string",
+                            "description": "Working directory to execute the command in. Defaults to "
+                                           "the current working directory. When possible, avoid "
+                                           "changing directories in the command and set the working "
+                                           "directory here instead."},
+                "timeout": {"type": "integer", "minimum": 0,
+                            "description": "Timeout in milliseconds. Set to 0 to disable the timeout. "
+                                           "Defaults to 120000 for foreground commands. Background "
+                                           "commands have no timeout by default."},
+                "background": {"type": "boolean",
+                               "description": "Run the command in the background and return immediately "
+                                              "(useful for dev servers and long-running builds). You do "
+                                              "not need to use '&' at the end of the command when using "
+                                              "this parameter. You will be notified when it completes. "
+                                              "DO NOT poll for completion."},
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+_BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+_OC_PREFIX_MASK = (1 << 48) - 1
+_OC_SESSIONS: dict[str, tuple[str, float]] = {}
+_OC_SESSION_TTL = 3600.0
+
+
+def opencode_is_free_model(model: str) -> bool:
+    """True for the keyless free-tier lane (v2 /inference/v1 + fingerprint)."""
+    base = str(model or "").split("(")[0].strip().lower()
+    return base.endswith("-free") or ":free" in base
+
+
+def _opencode_session_id() -> str:
+    """ses_<12 hex of ~(ms*0x1000+1)><14 base62>.
+
+    Upstream decodes the prefix as an inverted timestamp and rejects a large
+    counter, so the counter is pinned to 1 exactly like the CLI.
+    """
+    ms = int(time.time() * 1000)
+    prefix = (~(ms * 0x1000 + 1)) & _OC_PREFIX_MASK
+    tail = "".join(_BASE62[secrets.randbelow(256) % 62] for _ in range(14))
+    return "ses_%012x%s" % (prefix, tail)
+
+
+def opencode_session(entry: dict) -> str:
+    """One stable session per connection.
+
+    Upstream meters the free tier per session; minting a fresh id per request
+    burns the quota and surfaces as 429 FreeUsageLimitError.
+    """
+    ident = str(entry.get("id") or entry.get("key") or "default")
+    now = time.time()
+    hit = _OC_SESSIONS.get(ident)
+    if hit and now - hit[1] < _OC_SESSION_TTL:
+        _OC_SESSIONS[ident] = (hit[0], now)
+        return hit[0]
+    sid = _opencode_session_id()
+    if len(_OC_SESSIONS) > 500:
+        _OC_SESSIONS.pop(next(iter(_OC_SESSIONS)), None)
+    _OC_SESSIONS[ident] = (sid, now)
+    return sid
+
+
+def opencode_v2_headers(ses: str) -> dict:
+    """v2 identity. x-opencode-request is deliberately absent (upstream 403s on it)."""
+    return {
+        "Authorization": "Bearer public",
+        "User-Agent": OPENCODE_V2_UA,
+        "x-opencode-client": OPENCODE_V2_CLIENT,
+        "x-opencode-session": ses,
+        "x-opencode-session-id": ses,
+        "x-session-affinity": ses,
+        "x-session-id": ses,
+        "x-opencode-project": OPENCODE_V2_PROJECT,
+    }
+
+
+def _oc_tool_name(tool: dict) -> str:
+    if not isinstance(tool, dict):
+        return ""
+    if isinstance(tool.get("name"), str) and tool["name"].strip():
+        return tool["name"].strip()
+    fn = tool.get("function")
+    if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+        return fn["name"].strip()
+    return ""
+
+
+def _oc_tool_def(tool: dict) -> dict:
+    fn = tool.get("function") if isinstance(tool, dict) else None
+    return fn if isinstance(fn, dict) else (tool if isinstance(tool, dict) else {})
+
+
+def _oc_set_tool_name(tool: dict, name: str) -> dict:
+    if isinstance(tool.get("function"), dict):
+        return {**tool, "function": {**tool["function"], "name": name}}
+    return {**tool, "name": name}
+
+
+def apply_opencode_v2_tools(body: dict) -> dict:
+    """Force stream, alias clashing caller tools, append the fingerprint pair.
+
+    Returns {sent_name: original_name} for caller tools we had to rename.
+    """
+    if not isinstance(body, dict):
+        return {}
+    # The free lane rejects non-streaming requests outright.
+    body["stream"] = True
+    # Upstream answers tool_choice "none" with 403, so never forward that.
+    if body.get("tool_choice") == "none":
+        body.pop("tool_choice", None)
+
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        tools = []
+    tools = [t for t in tools if isinstance(t, dict)]
+
+    taken = {_oc_tool_name(t) for t in tools}
+    rename: dict[str, str] = {}
+    kept_fp: set[str] = set()
+    out: list[dict] = []
+    for tool in tools:
+        name = _oc_tool_name(tool)
+        if name not in OPENCODE_FINGERPRINT_TOOLS:
+            out.append(tool)
+            continue
+        if name in kept_fp:
+            continue  # duplicate declarations of one name are rejected
+        want = OPENCODE_V2_TOOL_DEFS[name]
+        got = _oc_tool_def(tool)
+        if got.get("description") == want["description"] and \
+                got.get("parameters") == want["parameters"]:
+            kept_fp.add(name)
+            out.append(tool)
+            continue
+        # Caller ships its own `read`/`shell`: move it aside so the verbatim
+        # fingerprint definition can still be appended under the real name.
+        alias = name + "_client"
+        i = 2
+        while alias in taken:
+            alias = "%s_client%d" % (name, i)
+            i += 1
+        taken.add(alias)
+        rename[alias] = name
+        out.append(_oc_set_tool_name(tool, alias))
+
+    appended: list[str] = []
+    for name in OPENCODE_FINGERPRINT_TOOLS:
+        if name in kept_fp:
+            continue
+        d = OPENCODE_V2_TOOL_DEFS[name]
+        out.append({"type": "function",
+                    "function": {"name": name, "description": d["description"],
+                                 "parameters": d["parameters"]}})
+        appended.append(name)
+    body["tools"] = out
+
+    if appended:
+        # Without the old "do not use" wording the model actually calls these;
+        # "not available" made it also refuse the caller's own tools.
+        listed = " or ".join("`%s`" % n for n in appended)
+        note = ("Do not call the %s tools; they are placeholders that do nothing. "
+                "Use the other tools you have been given instead." % listed)
+        msgs = body.get("messages")
+        if isinstance(msgs, list):
+            if msgs and isinstance(msgs[0], dict) and msgs[0].get("role") == "system" \
+                    and isinstance(msgs[0].get("content"), str):
+                msgs[0] = {**msgs[0], "content": msgs[0]["content"] + "\n\n" + note}
+            else:
+                body["messages"] = [{"role": "system", "content": note}] + msgs
+        elif isinstance(body.get("system"), str):
+            body["system"] = body["system"] + "\n\n" + note
+    return rename
+
+
+def _oc_restore_choice(choice, rename: dict):
+    if not isinstance(rename, dict) or not isinstance(choice, dict):
+        return choice
+    if isinstance(choice.get("name"), str):
+        original = rename.get(choice["name"].strip())
+        return {**choice, "name": original} if original else choice
+    fn = choice.get("function")
+    if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+        original = rename.get(fn["name"].strip())
+        if original:
+            return {**choice, "function": {**fn, "name": original}}
+    return choice
+
+
+def restore_opencode_tool_names(payload, rename: dict):
+    """Put the caller's original tool spellings back in a response/SSE payload."""
+    if not rename or not isinstance(payload, dict):
+        return payload
+    changed = False
+    out = dict(payload)
+
+    choices = out.get("choices")
+    if isinstance(choices, list):
+        new_choices = []
+        for choice in choices:
+            if not isinstance(choice, dict):
+                new_choices.append(choice)
+                continue
+            new_choice = dict(choice)
+            for holder in ("delta", "message"):
+                msg = new_choice.get(holder)
+                if not isinstance(msg, dict):
+                    continue
+                calls = msg.get("tool_calls")
+                if not isinstance(calls, list) or not calls:
+                    continue
+                new_calls = []
+                for call in calls:
+                    fn = call.get("function") if isinstance(call, dict) else None
+                    if isinstance(fn, dict) and isinstance(fn.get("name"), str) \
+                            and fn["name"] in rename:
+                        new_calls.append({**call, "function": {**fn, "name": rename[fn["name"]]}})
+                        changed = True
+                    else:
+                        new_calls.append(call)
+                new_choice[holder] = {**msg, "tool_calls": new_calls}
+            new_choices.append(new_choice)
+        if changed:
+            out["choices"] = new_choices
+
+    content = out.get("content")
+    if isinstance(content, list):
+        new_content = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use" \
+                    and isinstance(block.get("name"), str) and block["name"] in rename:
+                new_content.append({**block, "name": rename[block["name"]]})
+                changed = True
+            else:
+                new_content.append(block)
+        if changed:
+            out["content"] = new_content
+
+    output = out.get("output")
+    if isinstance(output, list):
+        new_output = []
+        for item in output:
+            if isinstance(item, dict) and item.get("type") == "function_call" \
+                    and isinstance(item.get("name"), str) and item["name"] in rename:
+                new_output.append({**item, "name": rename[item["name"]]})
+                changed = True
+            else:
+                new_output.append(item)
+        if changed:
+            out["output"] = new_output
+
+    inner = out.get("item")
+    if isinstance(inner, dict) and inner.get("type") == "function_call" \
+            and isinstance(inner.get("name"), str) and inner["name"] in rename:
+        out["item"] = {**inner, "name": rename[inner["name"]]}
+        changed = True
+
+    block = out.get("content_block")
+    if isinstance(block, dict) and block.get("type") == "tool_use" \
+            and isinstance(block.get("name"), str) and block["name"] in rename:
+        out["content_block"] = {**block, "name": rename[block["name"]]}
+        changed = True
+
+    if "tool_choice" in out and out["tool_choice"] != "none":
+        restored = _oc_restore_choice(out["tool_choice"], rename)
+        if restored is not out["tool_choice"]:
+            out["tool_choice"] = restored
+
+    return out if changed else payload
+
+
+def aggregate_openai_sse(resp, router_model: str, rename: dict | None = None) -> dict:
+    """Collapse an upstream SSE chat.completion stream into one JSON response."""
+    content: list[str] = []
+    reasoning: list[str] = []
+    finish = "stop"
+    usage: dict = {}
+    created = int(time.time())
+    resp_id = "chatcmpl-" + uuid.uuid4().hex[:24]
+    model = router_model
+    tool_calls: dict[int, dict] = {}
+    order: list[int] = []
+    whole: dict = {}
+
+    def absorb(ev: dict) -> None:
+        nonlocal finish, created, model, usage, resp_id
+        if isinstance(ev.get("id"), str) and ev["id"]:
+            resp_id = ev["id"]
+        if isinstance(ev.get("model"), str) and ev["model"]:
+            model = ev["model"]
+        if isinstance(ev.get("created"), (int, float)):
+            created = int(ev["created"])
+        if isinstance(ev.get("usage"), dict) and ev["usage"]:
+            usage = ev["usage"]
+        for choice in (ev.get("choices") or []):
+            if not isinstance(choice, dict):
+                continue
+            if choice.get("finish_reason"):
+                finish = choice["finish_reason"]
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                delta = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+            if isinstance(delta.get("content"), str):
+                content.append(delta["content"])
+            if isinstance(delta.get("reasoning_content"), str):
+                reasoning.append(delta["reasoning_content"])
+            for call in (delta.get("tool_calls") or []):
+                if not isinstance(call, dict):
+                    continue
+                idx = call.get("index")
+                idx = idx if isinstance(idx, int) else (order[-1] if order else 0)
+                slot = tool_calls.get(idx)
+                if slot is None:
+                    slot = {"index": idx, "id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""}}
+                    tool_calls[idx] = slot
+                    order.append(idx)
+                if isinstance(call.get("id"), str) and call["id"]:
+                    slot["id"] = call["id"]
+                fn = call.get("function") or {}
+                if isinstance(fn, dict):
+                    if isinstance(fn.get("name"), str) and fn["name"]:
+                        slot["function"]["name"] += fn["name"]
+                    if isinstance(fn.get("arguments"), str):
+                        slot["function"]["arguments"] += fn["arguments"]
+
+    iter_lines = getattr(resp, "iter_lines", None)
+    if not callable(iter_lines):
+        # no streaming body available on this response object
+        try:
+            j = resp.json()
+        except (ValueError, TypeError, AttributeError):
+            j = {}
+        if isinstance(j, dict):
+            j = dict(j)
+            j["model"] = router_model
+            return restore_opencode_tool_names(j, rename) if rename else j
+
+    for raw in resp.iter_lines(decode_unicode=False):
+        if not raw:
+            continue
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        line = line.strip()
+        if not line.startswith("data:"):
+            # upstream ignored stream:true and sent a plain JSON body
+            if line.startswith("{"):
+                try:
+                    ev = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(ev, dict):
+                    if ev.get("choices") and not any(
+                            isinstance(c, dict) and "delta" in c
+                            for c in ev["choices"]):
+                        whole = ev  # already a finished chat.completion
+                    else:
+                        absorb(ev)
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            ev = json.loads(payload)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(ev, dict):
+            absorb(ev)
+
+    if whole and not content and not tool_calls:
+        whole = dict(whole)
+        whole["model"] = router_model
+        return restore_opencode_tool_names(whole, rename) if rename else whole
+
+    message: dict = {"role": "assistant", "content": "".join(content)}
+    if reasoning:
+        message["reasoning_content"] = "".join(reasoning)
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+        if not message["content"]:
+            message["content"] = None
+
+    out = {
+        "id": resp_id, "object": "chat.completion", "created": created,
+        "model": router_model, "choices": [
+            {"index": 0, "message": message, "finish_reason": finish}],
+        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+    if rename:
+        out = restore_opencode_tool_names(out, rename)
+    return out
+
+
+def opencode_device_start(server: str = OPENCODE_CONSOLE) -> dict:
+    """Start an OpenCode Console device-code login. Returns the JSON response."""
+    resp = requests.post(
+        f"{server.rstrip('/')}/auth/device/code",
+        headers=_opencode_console_headers(),
+        json={"client_id": OPENCODE_CLIENT_ID, "supports_org_scope": True},
+        timeout=30)
+    resp.raise_for_status()
+    j = resp.json()
+    return j if isinstance(j, dict) else {}
+
+
+def opencode_device_poll(device_code: str, server: str = OPENCODE_CONSOLE):
+    """Poll the device-code token endpoint. Returns the raw requests.Response."""
+    return requests.post(
+        f"{server.rstrip('/')}/auth/device/token",
+        headers=_opencode_console_headers(),
+        json={"grant_type": OPENCODE_DEVICE_GRANT,
+              "device_code": device_code, "client_id": OPENCODE_CLIENT_ID},
+        timeout=30)
+
+
+def opencode_console_get(path: str, token: str, server: str = OPENCODE_CONSOLE):
+    """Authenticated GET against the OpenCode Console API."""
+    return requests.get(
+        f"{server.rstrip('/')}{path}",
+        headers=_opencode_console_headers(token),
+        timeout=30)
+
+
+def opencode_account_metadata(tokens: dict | None = None, user: dict | None = None,
+                              orgs: list | None = None) -> dict:
+    """Build connection metadata from token/user/org responses (defensive to shapes)."""
+    tokens = tokens or {}
+    user = user or {}
+    orgs = orgs or []
+    org = orgs[0] if orgs and isinstance(orgs[0], dict) else {}
+
+    def _pick(d: dict, *keys):
+        for k in keys:
+            v = d.get(k)
+            if v:
+                return str(v)
+        return ""
+
+    return {
+        "account_id": _pick(tokens, "account_id", "accountID")
+        or _pick(user, "id", "accountID", "account_id"),
+        "email": _pick(user, "email", "primary_email") or _pick(tokens, "email"),
+        "org_id": _pick(tokens, "org_id", "orgID") or _pick(org, "id", "orgID"),
+        "org_name": _pick(org, "name", "slug") or _pick(tokens, "org_name"),
+    }
+
+
+def opencode_needs_refresh(entry: dict) -> bool:
+    """True when an oauth OpenCode connection's access token is (nearly) expired."""
+    if not isinstance(entry, dict) or entry.get("auth_type") != "oauth":
+        return False
+    if not entry.get("key"):
+        return False
+    try:
+        exp = int(entry.get("expires_at", 0) or 0)
+    except (TypeError, ValueError):
+        exp = 0
+    if exp <= 0:
+        return False
+    return exp - int(time.time()) <= 60
+
+
+def opencode_refresh_access(entry: dict, proxy: dict | None = None,
+                            server: str | None = None) -> bool:
+    """Refresh an oauth connection's access token in place. Returns True on success."""
+    server = (server or entry.get("console_server") or OPENCODE_CONSOLE).rstrip("/")
+    refresh_token = str(entry.get("refresh_token") or "")
+    if not refresh_token:
+        return False
+    try:
+        resp = requests.post(
+            f"{server}/auth/device/token",
+            headers=_opencode_console_headers(),
+            json={"grant_type": "refresh_token", "refresh_token": refresh_token,
+                  "client_id": OPENCODE_CLIENT_ID},
+            timeout=30, proxies=proxy)
+    except requests.RequestException:
+        return False
+    if resp.status_code != 200:
+        return False
+    try:
+        j = resp.json()
+    except (ValueError, TypeError):
+        return False
+    access = (j or {}).get("access_token")
+    if not access:
+        return False
+    entry["key"] = access
+    if j.get("refresh_token"):
+        entry["refresh_token"] = j["refresh_token"]
+    try:
+        expires_in = int(j.get("expires_in", 3600) or 3600)
+    except (TypeError, ValueError):
+        expires_in = 3600
+    entry["expires_at"] = int(time.time()) + expires_in
+    return True
+
+
 def _close_quietly(resp) -> None:
     try:
         resp.close()
@@ -1942,40 +2730,80 @@ def _close_quietly(resp) -> None:
 
 def call_upstream(protocol: str, body: dict, gemini_model: str = "",
                   stream: bool = False, timeout=60,
-                  extra_headers: dict | None = None):
+                  extra_headers: dict | None = None, provider: str = "",
+                  oc_state: dict | None = None):
     """POST to upstream; returns (entry, response).
 
     Keys speaking the same protocol are tried round-robin; on 401/403/429
     or a connection error the next key is tried. On success (200) the order
     is advanced. A non-200 response is still returned (the handler decides);
     if no attempt can be made at all, an exception is raised.
+
+    `provider` pins the pool to one provider (the model mapping's provider) so
+    a request for a commandcode model never lands on another openai-protocol key.
+    `oc_state`, when a dict is passed, receives OpenCode v2 free-lane details
+    ({rename, session, forced_stream}) so the handler can aggregate/restore.
     """
     with _lock:
         data = load_data()
-    pool = _ordered_pool(data, protocol)
+        pool = _ordered_pool(data, protocol, provider)
+        proxies_for: dict[str, str | None] = {}
+        for entry in pool:
+            prov = entry.get("provider") or ""
+            if prov not in proxies_for:
+                proxies_for[prov] = _pick_proxy(data, prov)
+        # OpenCode Console connections (device-code OAuth): refresh expired tokens
+        for entry in pool:
+            if opencode_needs_refresh(entry):
+                opencode_refresh_access(
+                    entry, _proxy_dict(proxies_for.get(entry.get("provider") or "")))
+        save_data(data)  # persist proxy rotation cursors + refreshed tokens
     last_exc: Exception | None = None
     for i, entry in enumerate(pool):
         base = effective_base(entry)
         key = entry.get("key", "")
+        entry_provider = entry.get("provider") or ""
+        proxy = _proxy_dict(proxies_for.get(entry_provider))
+        merged_extra = {**(extra_headers or {}),
+                        **provider_custom_headers(data, entry_provider)}
+
+        # OpenCode v2: keyless free tier lives on /inference/v1 behind the v2
+        # fingerprint. Paid/keyed Zen stays on /zen/v1 untouched.
+        if entry_provider == "opencode" and opencode_is_free_model(body.get("model")):
+            base = OPENCODE_INFERENCE_BASE
+            ses = opencode_session(entry)
+            merged_extra = {**opencode_v2_headers(ses),
+                            **{k: v for k, v in merged_extra.items() if v}}
+            # upstream insists on stream:true; the handler aggregates if needed
+            rename = apply_opencode_v2_tools(body)
+            if oc_state is not None:
+                oc_state.update({"rename": rename, "session": ses, "forced_stream": True})
+            merged_extra.setdefault("Accept", "text/event-stream")
+
         try:
             if protocol == "openai":
                 resp = requests.post(
                     openai_chat_url(base),
-                    headers=upstream_headers(protocol, key, extra_headers),
-                    json=body, timeout=timeout, stream=stream)
+                    headers=upstream_headers(protocol, key, merged_extra),
+                    json=body, timeout=timeout, stream=stream, proxies=proxy)
             elif protocol == "anthropic":
                 resp = requests.post(
                     anthropic_messages_url(base),
-                    headers=upstream_headers(protocol, key, extra_headers),
-                    json=body, timeout=timeout, stream=stream)
+                    headers=upstream_headers(protocol, key, merged_extra),
+                    json=body, timeout=timeout, stream=stream, proxies=proxy)
             else:
                 url = gemini_generate_url(base, gemini_model) + f"?key={key}"
-                resp = requests.post(url, json=body, timeout=timeout)
+                kwargs: dict = {"json": body, "timeout": timeout}
+                if merged_extra:
+                    kwargs["headers"] = upstream_headers("gemini", key, merged_extra)
+                if proxy:
+                    kwargs["proxies"] = proxy
+                resp = requests.post(url, **kwargs)
         except requests.RequestException as exc:
             last_exc = exc
             continue
         if resp.status_code == 200:
-            _advance_provider_index(protocol, len(pool))
+            _advance_provider_index(protocol, len(pool), provider)
             return entry, resp
         if resp.status_code in (401, 403, 429) and i < len(pool) - 1:
             _close_quietly(resp)
@@ -1985,16 +2813,17 @@ def call_upstream(protocol: str, body: dict, gemini_model: str = "",
     raise last_exc or RuntimeError("upstream call failed.")
 
 
-def call_gemini(gemini_model: str, payload: dict, timeout: int = 60) -> dict:
+def call_gemini(gemini_model: str, payload: dict, timeout: int = 60,
+                provider: str = "") -> dict:
     """Legacy signature kept: JSON call with the gemini protocol, returns a dict."""
     _entry, resp = call_upstream("gemini", payload, gemini_model=gemini_model,
-                                 stream=False, timeout=timeout)
+                                 stream=False, timeout=timeout, provider=provider)
     if resp.status_code != 200:
         raise RuntimeError(f"Gemini {resp.status_code}: {resp.text[:500]}")
     return resp.json()
 
 
-def _rewrite_sse_line(line: bytes, router_model: str) -> bytes:
+def _rewrite_sse_line(line: bytes, router_model: str, rename: dict | None = None) -> bytes:
     try:
         s = line.decode("utf-8", "replace")
     except Exception:
@@ -2012,11 +2841,13 @@ def _rewrite_sse_line(line: bytes, router_model: str) -> bytes:
                 msg = j.get("message")
                 if isinstance(msg, dict) and isinstance(msg.get("model"), str):
                     msg["model"] = router_model
+                if rename:
+                    j = restore_opencode_tool_names(j, rename)
                 return ("data: " + json.dumps(j, ensure_ascii=False)).encode("utf-8")
     return line
 
 
-def rewrite_sse_model(chunks, router_model: str):
+def rewrite_sse_model(chunks, router_model: str, rename: dict | None = None):
     """Replace the model name in the upstream SSE stream with the router name (pure generator)."""
     buf = b""
     for chunk in chunks or []:
@@ -2025,17 +2856,17 @@ def rewrite_sse_model(chunks, router_model: str):
         buf += chunk or b""
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
-            yield _rewrite_sse_line(line, router_model) + b"\n"
+            yield _rewrite_sse_line(line, router_model, rename) + b"\n"
     if buf:
         yield _rewrite_sse_line(buf, router_model)
 
 
-def proxy_sse_response(upstream_resp, router_model: str) -> Response:
+def proxy_sse_response(upstream_resp, router_model: str, rename: dict | None = None) -> Response:
     """Relay the upstream SSE stream to the client as-is (model name fixed)."""
     def gen():
         try:
             yield from rewrite_sse_model(
-                upstream_resp.iter_content(chunk_size=4096), router_model)
+                upstream_resp.iter_content(chunk_size=4096), router_model, rename)
         finally:
             _close_quietly(upstream_resp)
 
@@ -2230,12 +3061,21 @@ def create_app() -> Flask:
     def admin():
         return render_template("admin.html")
 
+    @app.get("/admin/providers/<provider_id>")
+    def admin_provider_page(provider_id: str):
+        return render_template("provider.html", provider_id=provider_id)
+
     def _masked_provider_key(k: dict) -> dict:
         return {"id": k.get("id", ""), "label": k.get("label", ""),
                 "provider": k.get("provider", "gemini"),
                 "protocol": effective_protocol(k),
                 "base_url": k.get("base_url", ""),
                 "effective_base": effective_base(k),
+                "priority": int(k.get("priority", 1) or 1),
+                "proxy_pool": k.get("proxy_pool", "none") or "none",
+                "auth_type": k.get("auth_type", "key"),
+                "account": k.get("account", {}) or {},
+                "expires_at": k.get("expires_at", 0) or 0,
                 "key": mask_key(k.get("key", "")),
                 "created_at": k.get("created_at", "")}
 
@@ -2322,6 +3162,11 @@ def create_app() -> Flask:
                 provider, body.get("protocol"), body.get("base_url"))
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        try:
+            priority = int(body.get("priority", 1) or 1)
+        except (TypeError, ValueError):
+            priority = 1
+        proxy_pool = str(body.get("proxy_pool", "none") or "none").strip() or "none"
         with _lock:
             data = load_data()
             if any(k.get("key") == key for k in data.get("provider_keys", [])):
@@ -2329,6 +3174,7 @@ def create_app() -> Flask:
             data["provider_keys"].append({
                 "id": uuid.uuid4().hex[:8], "key": key, "label": label,
                 "provider": provider, "protocol": protocol, "base_url": base_url,
+                "priority": priority, "proxy_pool": proxy_pool,
                 "created_at": _now_iso(),
             })
             save_data(data)
@@ -2354,6 +3200,438 @@ def create_app() -> Flask:
         if (err := need_admin_auth()) is not None:
             return err
         return _delete_provider_key(key_id)
+
+    def _probe_provider_key(protocol: str, base: str, key: str,
+                            extra_headers: dict | None = None,
+                            proxy: dict | None = None) -> dict:
+        """Lightweight validity probe: GET the upstream model list (never raises)."""
+        base = (base or "").rstrip("/")
+        if not base:
+            return {"ok": False, "status": 0, "message": "base URL is empty", "models": None}
+        extra = extra_headers or {}
+        try:
+            if protocol == "anthropic":
+                headers = {"anthropic-version": ANTHROPIC_VERSION}
+                if key:
+                    headers["x-api-key"] = key
+                headers.update(extra)
+                resp = requests.get(base + "/models", headers=headers, timeout=15,
+                                    proxies=proxy)
+            elif protocol == "gemini":
+                kwargs: dict = {"timeout": 15}
+                if extra:
+                    kwargs["headers"] = extra
+                if proxy:
+                    kwargs["proxies"] = proxy
+                resp = requests.get(base + f"/v1beta/models?key={key}", **kwargs)
+            else:
+                headers = {"Authorization": f"Bearer {key}"} if key else {}
+                headers.update(extra)
+                resp = requests.get(base + "/models", headers=headers, timeout=15,
+                                    proxies=proxy)
+        except requests.RequestException as exc:
+            return {"ok": False, "status": 0,
+                    "message": f"connection error: {exc}"[:300], "models": None}
+        ok = resp.status_code == 200
+        count = None
+        if ok:
+            try:
+                j = resp.json()
+                data = j.get("data") if isinstance(j, dict) else None
+                if isinstance(data, list):
+                    count = len(data)
+            except (ValueError, TypeError):
+                count = None
+        message = "key is valid" if ok else _cross_error_message(protocol, resp)
+        return {"ok": ok, "status": resp.status_code, "message": message, "models": count}
+
+    @app.post("/admin/api/provider-keys/check")
+    def admin_check_provider_key():
+        if (err := need_admin_auth()) is not None:
+            return err
+        body = request.get_json(force=True, silent=True) or {}
+        key = str(body.get("key", "")).strip()
+        provider = str(body.get("provider", "opencode")).strip().lower() or "opencode"
+        try:
+            protocol, base_url = normalize_provider_key(
+                provider, body.get("protocol"), body.get("base_url"))
+        except ValueError as exc:
+            return jsonify({"ok": False, "status": 0, "message": str(exc)}), 400
+        base = base_url or PROVIDER_DEFAULTS.get(provider, {}).get("base_url", "")
+        with _lock:
+            data = load_data()
+            proxy = _proxy_dict(_pick_proxy(data, provider))
+            save_data(data)
+        return jsonify(_probe_provider_key(protocol, base, key,
+                                           provider_custom_headers(data, provider), proxy))
+
+    @app.post("/admin/api/provider-keys/test-all")
+    def admin_test_all_provider_keys():
+        if (err := need_admin_auth()) is not None:
+            return err
+        with _lock:
+            data = load_data()
+            proxies: dict[str, dict | None] = {}
+            for k in data.get("provider_keys", []):
+                prov = (k.get("provider") or "") if isinstance(k, dict) else ""
+                if prov not in proxies:
+                    proxies[prov] = _proxy_dict(_pick_proxy(data, prov))
+            save_data(data)
+        results = []
+        for k in data.get("provider_keys", []):
+            if not isinstance(k, dict):
+                continue
+            prov = k.get("provider") or ""
+            probe = _probe_provider_key(effective_protocol(k), effective_base(k),
+                                        k.get("key", ""),
+                                        provider_custom_headers(data, prov),
+                                        proxies.get(prov))
+            results.append({"id": k.get("id", ""), "label": k.get("label", ""),
+                            "ok": probe.get("ok", False),
+                            "status": probe.get("status", 0),
+                            "message": probe.get("message", "")})
+        return jsonify({"results": results})
+
+    # --- Provider detail page API (OpenCode connections + settings + models) ---
+
+    def _proxy_pool_public(p: dict) -> dict:
+        return {"id": p.get("id", ""), "name": p.get("name", ""),
+                "proxies": [str(x) for x in (p.get("proxies") or [])]}
+
+    def _provider_detail(provider_id: str) -> dict:
+        pid = (provider_id or "").strip().lower()
+        data = load_data()
+        keys = [k for k in data.get("provider_keys", [])
+                if isinstance(k, dict) and (k.get("provider") or "") == pid]
+        models = [m for m in data.get("models", [])
+                  if isinstance(m, dict) and (m.get("provider") or "") == pid]
+        have = {str(m.get("upstream_model") or "") for m in models}
+        suggestions = [s for s in PROVIDER_SUGGESTIONS.get(pid, []) if s not in have]
+        return {
+            "id": pid,
+            "name": provider_display_name(pid),
+            "short": provider_short(pid),
+            "protocol": route_protocol_for_provider(pid),
+            "base_url": PROVIDER_DEFAULTS.get(pid, {}).get("base_url", ""),
+            "auth_required": pid not in ("opencode",),
+            "connected": bool(keys),
+            "count": len(keys),
+            "settings": get_provider_settings(data, pid),
+            "connections": [_masked_provider_key(k) for k in keys],
+            "models": [{"name": m.get("name", ""),
+                        "upstream_model": str(m.get("upstream_model") or m.get("gemini_model") or ""),
+                        "description": m.get("description", ""),
+                        "disabled": bool(m.get("disabled"))} for m in models],
+            "suggestions": suggestions,
+            "pools": [_proxy_pool_public(p) for p in data.get("proxy_pools", [])
+                      if isinstance(p, dict)],
+        }
+
+    @app.get("/admin/api/providers/<provider_id>")
+    def admin_provider_detail(provider_id: str):
+        if (err := need_admin_auth()) is not None:
+            return err
+        return jsonify(_provider_detail(provider_id))
+
+    @app.post("/admin/api/providers/<provider_id>/settings")
+    def admin_provider_settings(provider_id: str):
+        if (err := need_admin_auth()) is not None:
+            return err
+        pid = (provider_id or "").strip().lower()
+        if pid not in PROVIDERS:
+            return jsonify({"error": f"unknown provider: {pid}"}), 400
+        body = request.get_json(force=True, silent=True) or {}
+        with _lock:
+            data = load_data()
+            ps = data.setdefault("provider_settings", {}).setdefault(pid, {})
+            if "proxy_pool" in body:
+                ps["proxy_pool"] = str(body.get("proxy_pool") or "none")
+            if "rotation" in body:
+                rot = str(body.get("rotation") or "none").lower()
+                if rot not in ("none", "round_robin", "random"):
+                    return jsonify({"error": "rotation must be none|round_robin|random"}), 400
+                ps["rotation"] = rot
+            if "thinking" in body:
+                th = str(body.get("thinking") or "auto").lower()
+                if th not in ("auto", "on", "off"):
+                    return jsonify({"error": "thinking must be auto|on|off"}), 400
+                ps["thinking"] = th
+            if "headers_active" in body:
+                ps["headers_active"] = bool(body.get("headers_active"))
+            if "custom_headers" in body:
+                clean = []
+                for h in body.get("custom_headers") or []:
+                    if isinstance(h, dict) and str(h.get("name", "")).strip():
+                        clean.append({"name": str(h["name"]).strip(),
+                                      "value": str(h.get("value", "")),
+                                      "enabled": bool(h.get("enabled", True))})
+                ps["custom_headers"] = clean
+            save_data(data)
+        return jsonify({"ok": True, "settings": get_provider_settings(data, pid)})
+
+    # --- OpenCode Console account connection (device-code OAuth) ---
+
+    def _opencode_finish_connect(tokens: dict):
+        access = str(tokens.get("access_token") or "")
+        refresh_token = str(tokens.get("refresh_token") or "")
+        try:
+            expires_in = int(tokens.get("expires_in", 3600) or 3600)
+        except (TypeError, ValueError):
+            expires_in = 3600
+        user: dict = {}
+        orgs: list = []
+        try:
+            ur = opencode_console_get("/api/user", access)
+            if ur.status_code == 200:
+                uj = ur.json()
+                user = uj if isinstance(uj, dict) else {}
+        except (requests.RequestException, ValueError, TypeError):
+            user = {}
+        try:
+            orr = opencode_console_get("/api/orgs", access)
+            if orr.status_code == 200:
+                oj = orr.json()
+                if isinstance(oj, dict):
+                    oj = oj.get("orgs") or oj.get("data") or []
+                orgs = oj if isinstance(oj, list) else []
+        except (requests.RequestException, ValueError, TypeError):
+            orgs = []
+        meta = opencode_account_metadata(tokens, user, orgs)
+        label = meta.get("email") or meta.get("org_name") or meta.get("account_id") \
+            or "OpenCode account"
+        with _lock:
+            data = load_data()
+            acct_id = meta.get("account_id") or ""
+            if acct_id:  # replace an existing connection for the same account
+                data["provider_keys"] = [
+                    k for k in data.get("provider_keys", [])
+                    if not (isinstance(k, dict) and k.get("auth_type") == "oauth"
+                            and (k.get("account") or {}).get("account_id") == acct_id)]
+            entry = {
+                "id": uuid.uuid4().hex[:8], "key": access, "label": label,
+                "provider": "opencode", "protocol": "openai", "base_url": "",
+                "priority": 1, "proxy_pool": "none", "auth_type": "oauth",
+                "refresh_token": refresh_token,
+                "expires_at": int(time.time()) + expires_in,
+                "console_server": OPENCODE_CONSOLE, "account": meta,
+                "created_at": _now_iso(),
+            }
+            data.setdefault("provider_keys", []).append(entry)
+            save_data(data)
+        return jsonify({"status": "complete",
+                        "connection": _masked_provider_key(entry)})
+
+    @app.post("/admin/api/providers/<provider_id>/opencode/connect/start")
+    def admin_opencode_connect_start(provider_id: str):
+        if (err := need_admin_auth()) is not None:
+            return err
+        if (provider_id or "").strip().lower() != "opencode":
+            return jsonify({"error": "only the opencode provider supports account login"}), 400
+        try:
+            j = opencode_device_start()
+        except requests.RequestException as exc:
+            return jsonify({"error": f"connection error: {exc}"[:300]}), 502
+        except (ValueError, TypeError):
+            return jsonify({"error": "invalid response from OpenCode console"}), 502
+        if not j.get("device_code"):
+            return jsonify({"error": "OpenCode console did not return a device code"}), 502
+        return jsonify({
+            "device_code": str(j.get("device_code", "")),
+            "user_code": str(j.get("user_code", "")),
+            "verification_uri": str(j.get("verification_uri", "")),
+            "verification_uri_complete": str(
+                j.get("verification_uri_complete") or j.get("verification_uri") or ""),
+            "interval": int(j.get("interval", 5) or 5),
+            "expires_in": int(j.get("expires_in", 900) or 900),
+        })
+
+    @app.post("/admin/api/providers/<provider_id>/opencode/connect/poll")
+    def admin_opencode_connect_poll(provider_id: str):
+        if (err := need_admin_auth()) is not None:
+            return err
+        if (provider_id or "").strip().lower() != "opencode":
+            return jsonify({"error": "only the opencode provider supports account login"}), 400
+        body = request.get_json(force=True, silent=True) or {}
+        device_code = str(body.get("device_code", "")).strip()
+        if not device_code:
+            return jsonify({"error": "device_code required"}), 400
+        try:
+            resp = opencode_device_poll(device_code)
+        except requests.RequestException as exc:
+            return jsonify({"status": "error",
+                            "message": f"connection error: {exc}"[:300]}), 502
+        try:
+            j = resp.json()
+        except (ValueError, TypeError):
+            j = {}
+        if isinstance(j, dict) and j.get("access_token"):
+            return _opencode_finish_connect(j)
+        err_code = ""
+        if isinstance(j, dict):
+            err_code = str(j.get("error", "") or "")
+            if not err_code and j.get("message"):
+                err_code = str(j["message"])
+        if err_code == "authorization_pending":
+            status = "pending"
+        elif err_code == "slow_down":
+            status = "slow_down"
+        elif err_code in ("expired_token", "access_denied"):
+            status = "expired"
+        else:
+            status = "error"
+        return jsonify({"status": status,
+                        "message": err_code or f"http {resp.status_code}"})
+
+    @app.get("/admin/api/proxy-pools")
+    def admin_list_proxy_pools():
+        if (err := need_admin_auth()) is not None:
+            return err
+        data = load_data()
+        return jsonify([_proxy_pool_public(p) for p in data.get("proxy_pools", [])
+                        if isinstance(p, dict)])
+
+    @app.get("/admin/api/combos")
+    def admin_list_combos():
+        if (err := need_admin_auth()) is not None:
+            return err
+        data = load_data()
+        now = int(time.time())
+        combos = [_combo_public(data, c, now) for c in list_combos(data)]
+        return jsonify({"combos": combos,
+                        "pickable": [m["name"] for m in data.get("models", [])
+                                     if isinstance(m, dict) and m.get("name")
+                                     and not m.get("disabled")]})
+
+    @app.post("/admin/api/combos")
+    def admin_save_combo():
+        """Create or update a combo. A combo aliases exactly one existing model."""
+        if (err := need_admin_auth()) is not None:
+            return err
+        body = request.get_json(force=True, silent=True) or {}
+        name = str(body.get("name", "")).strip()
+        model = str(body.get("model", "")).strip()
+        desc = str(body.get("description", "")).strip()
+        if not name:
+            return jsonify({"error": "combo name must not be empty"}), 400
+        if not COMBO_NAME_RE.match(name):
+            return jsonify({"error": "combo name may only contain letters, numbers, "
+                                     "'.', '_' and '-' (max 64)"}), 400
+        if not model:
+            return jsonify({"error": "combo must point at one model"}), 400
+        with _lock:
+            data = load_data()
+            models = {m["name"] for m in data.get("models", [])
+                      if isinstance(m, dict) and m.get("name")}
+            if model not in models:
+                return jsonify({"error": f"unknown model: {model}"}), 400
+            if find_combo(data, model):
+                return jsonify({"error": f"'{model}' is already used as a combo name"}), 400
+            if any(m.get("name") == name for m in data.get("models", [])
+                   if isinstance(m, dict)):
+                return jsonify({"error": f"'{name}' is already a model name"}), 400
+            combos = [c for c in (data.get("combos") or []) if isinstance(c, dict)]
+            existing = next((c for c in combos
+                             if str(c.get("name") or "").strip() == name), None)
+            if existing is None and len(combos) >= 50:
+                return jsonify({"error": "too many combos (max 50)"}), 400
+            if existing:
+                existing.update({"model": model, "description": desc})
+            else:
+                combos.append({"id": uuid.uuid4().hex[:8], "name": name,
+                               "model": model, "description": desc,
+                               "created_at": _now_iso()})
+            data["combos"] = combos
+            save_data(data)
+        return jsonify({"ok": True, "name": name}), 201
+
+    @app.delete("/admin/api/combos/<name>")
+    def admin_delete_combo(name: str):
+        if (err := need_admin_auth()) is not None:
+            return err
+        with _lock:
+            data = load_data()
+            combos = list_combos(data)
+            if not any(str(c.get("name")) == name for c in combos):
+                return jsonify({"error": f"unknown combo: {name}"}), 404
+            data["combos"] = [c for c in combos if str(c.get("name")) != name]
+            save_data(data)
+        return jsonify({"ok": True})
+
+    @app.post("/admin/api/proxy-pools")
+    def admin_add_proxy_pool():
+        if (err := need_admin_auth()) is not None:
+            return err
+        body = request.get_json(force=True, silent=True) or {}
+        name = str(body.get("name", "")).strip() or "pool"
+        raw = body.get("proxies")
+        if isinstance(raw, str):
+            raw = raw.splitlines()
+        proxies = [str(x).strip() for x in (raw or []) if str(x).strip()]
+        with _lock:
+            data = load_data()
+            entry = {"id": uuid.uuid4().hex[:8], "name": name, "proxies": proxies,
+                     "created_at": _now_iso()}
+            data.setdefault("proxy_pools", []).append(entry)
+            save_data(data)
+        return jsonify({"ok": True, "id": entry["id"], "pool": _proxy_pool_public(entry)}), 201
+
+    @app.delete("/admin/api/proxy-pools/<pool_id>")
+    def admin_del_proxy_pool(pool_id: str):
+        if (err := need_admin_auth()) is not None:
+            return err
+        with _lock:
+            data = load_data()
+            data["proxy_pools"] = [p for p in data.get("proxy_pools", [])
+                                   if p.get("id") != pool_id]
+            save_data(data)
+        return jsonify({"ok": True})
+
+    @app.post("/admin/api/providers/<provider_id>/models")
+    def admin_provider_add_model(provider_id: str):
+        if (err := need_admin_auth()) is not None:
+            return err
+        pid = (provider_id or "").strip().lower()
+        if pid not in PROVIDERS:
+            return jsonify({"error": f"unknown provider: {pid}"}), 400
+        body = request.get_json(force=True, silent=True) or {}
+        upstream = str(body.get("upstream_model", "")).strip()
+        if not upstream:
+            return jsonify({"error": "upstream_model required"}), 400
+        name = str(body.get("name", "")).strip() or f"{provider_short(pid)}/{upstream}"
+        with _lock:
+            data = load_data()
+            data["models"] = [m for m in data.get("models", []) if m.get("name") != name]
+            data["models"].append({"name": name, "provider": pid,
+                                   "upstream_model": upstream,
+                                   "description": str(body.get("description", "")).strip(),
+                                   "disabled": False})
+            save_data(data)
+        return jsonify({"ok": True, "name": name}), 201
+
+    @app.delete("/admin/api/providers/<provider_id>/models/<path:name>")
+    def admin_provider_del_model(provider_id: str, name: str):
+        if (err := need_admin_auth()) is not None:
+            return err
+        with _lock:
+            data = load_data()
+            data["models"] = [m for m in data.get("models", []) if m.get("name") != name]
+            save_data(data)
+        return jsonify({"ok": True})
+
+    @app.post("/admin/api/providers/<provider_id>/models/disable-all")
+    def admin_provider_disable_all(provider_id: str):
+        if (err := need_admin_auth()) is not None:
+            return err
+        pid = (provider_id or "").strip().lower()
+        with _lock:
+            data = load_data()
+            own = [m for m in data.get("models", [])
+                   if isinstance(m, dict) and (m.get("provider") or "") == pid]
+            any_enabled = any(not m.get("disabled") for m in own)
+            for m in own:
+                m["disabled"] = any_enabled
+            save_data(data)
+        return jsonify({"ok": True, "disabled": any_enabled})
 
     @app.post("/admin/api/keys")
     def admin_add_key():
@@ -2385,8 +3663,8 @@ def create_app() -> Flask:
         desc = str(body.get("description", "")).strip()
         if not name:
             return jsonify({"error": "model name (name) must not be empty"}), 400
-        if provider not in ("openai", "anthropic", "gemini"):
-            return jsonify({"error": "provider must be openai | anthropic | gemini"}), 400
+        if provider not in PROVIDERS:
+            return jsonify({"error": f"provider must be one of: {', '.join(PROVIDERS)}"}), 400
         with _lock:
             data = load_data()
             data["models"] = [m for m in data["models"] if m.get("name") != name]
@@ -2422,6 +3700,8 @@ def create_app() -> Flask:
             data.setdefault("settings", {})
             if "default_system" in body:
                 data["settings"]["default_system"] = str(body.get("default_system") or "")
+            if "round_robin" in body:
+                data["settings"]["round_robin"] = bool(body.get("round_robin"))
             save_data(data)
         return jsonify({"ok": True})
 
@@ -2433,9 +3713,26 @@ def create_app() -> Flask:
             meta["gemini_model"] = upstream  # for legacy clients
         if fallback:
             meta["fallback"] = True
-        return {"id": m["name"], "object": "model", "type": "model",
-                "owned_by": "samet-router", "created": now,
-                "display_name": m["name"], "meta": meta}
+        out = {"id": m["name"], "object": "model", "type": "model",
+               "owned_by": "samet-router", "created": now,
+               "display_name": m["name"], "meta": meta}
+        if m.get("combo"):
+            out["combo"] = True
+            out["combo_model"] = m.get("combo_model") or ""
+            out["description"] = m.get("description") or ""
+        return out
+
+    def _combo_public(data: dict, c: dict, now: int) -> dict:
+        target = resolve_target(data, str(c.get("model") or ""))
+        return _model_public({
+            "name": c.get("name"),
+            # report the provider id (like a normal model entry), not the wire protocol
+            "provider": target.get("provider_id") or target["provider"],
+            "upstream_model": target["upstream_model"],
+            "combo": True,
+            "combo_model": c.get("model") or "",
+            "description": c.get("description") or "",
+        }, now)
 
     # --- Router: OpenAI + Anthropic compatible model list ---
     @app.get("/v1/models")
@@ -2445,11 +3742,10 @@ def create_app() -> Flask:
             return err  # type: ignore[return-value]
         data = load_data()
         now = int(time.time())
-        return jsonify({
-            "object": "list",
-            "data": [_model_public(m, now) for m in data.get("models", [])
-                     if isinstance(m, dict) and m.get("name")],
-        })
+        rows = [_model_public(m, now) for m in data.get("models", [])
+                if isinstance(m, dict) and m.get("name") and not m.get("disabled")]
+        rows += [_combo_public(data, c, now) for c in list_combos(data)]
+        return jsonify({"object": "list", "data": rows})
 
     @app.get("/v1/models/<model_id>")
     def get_model(model_id: str):
@@ -2461,6 +3757,9 @@ def create_app() -> Flask:
         for m in data.get("models", []):
             if isinstance(m, dict) and m.get("name") == model_id:
                 return jsonify(_model_public(m, now))
+        combo = find_combo(data, model_id)
+        if combo:
+            return jsonify(_combo_public(data, combo, now))
         # unknown model (e.g. claude-*) still returns 200: Claude Code
         # checks model existence, falls back to the fallback target.
         target = resolve_target(data, model_id)
@@ -2469,18 +3768,13 @@ def create_app() -> Flask:
                                      now, fallback=True))
 
     # --- Router: OpenAI compatible ---
-    @app.post("/v1/chat/completions")
-    def chat_completions():
-        ok, err, key_info = need_router_auth()
-        if not ok:
-            return err  # type: ignore[return-value]
-        body = request.get_json(force=True, silent=True) or {}
+    def _chat_core(body: dict, key_info: dict, ep: str, forward_beta: dict | None = None):
+        forward_beta = forward_beta or {}
         router_model = str(body.get("model", "")).strip() or "samet-flash"
         messages = body.get("messages", [])
         stream = bool(body.get("stream", False))
         t0 = time.time()
         thinking = body_has_thinking("openai", body)
-        ep = "openai:/v1/chat/completions"
         kid, klabel = key_info.get("id", ""), key_info.get("label", "")
         try:
             with _lock:
@@ -2498,15 +3792,24 @@ def create_app() -> Flask:
                     up_body["messages"] = [
                         {"role": "system", "content": default_system.strip()},
                         *(messages or [])]
+                apply_thinking_default(
+                    up_body, "openai",
+                    get_provider_settings(data, target.get("provider_id") or "").get("thinking"))
+                oc: dict = {}
                 _entry, resp = call_upstream(
-                    "openai", up_body, stream=stream,
-                    timeout=STREAM_TIMEOUT if stream else 60)
-                if resp.status_code == 400 and not stream:
+                    "openai", up_body, stream=stream or bool(oc.get("forced_stream")),
+                    timeout=STREAM_TIMEOUT if stream else 60,
+                    provider=target.get("provider_id") or "", oc_state=oc)
+                # OpenCode free lane always streams upstream; aggregate for
+                # clients that asked for a single JSON response.
+                oc_streamed = bool(oc.get("forced_stream")) and not stream
+                if resp.status_code == 400 and not stream and not oc_streamed:
                     retry_body, removed = sanitize_openai_body_for_retry(up_body)
                     if removed:
                         _close_quietly(resp)
                         _entry2, resp2 = call_upstream(
-                            "openai", retry_body, stream=False, timeout=60)
+                            "openai", retry_body, stream=False, timeout=60,
+                            provider=target.get("provider_id") or "", oc_state=oc)
                         if resp2.status_code == 200:
                             resp = resp2
                             _entry = _entry2
@@ -2518,10 +3821,29 @@ def create_app() -> Flask:
                             _cross_error_message("openai", resp),
                             0, 0, kid, klabel, provider, thinking)
                     return forward_upstream_error("openai", resp)
+                rename = oc.get("rename") or {}
                 if stream:
                     add_log(ep, router_model, True, int((time.time() - t0) * 1000),
                             "", 0, 0, kid, klabel, provider, thinking)
-                    return proxy_sse_response(resp, router_model)
+                    return proxy_sse_response(resp, router_model, rename)
+                if oc_streamed:
+                    try:
+                        j = aggregate_openai_sse(resp, router_model, rename)
+                    except Exception as exc:
+                        _close_quietly(resp)
+                        add_log(ep, router_model, False, int((time.time() - t0) * 1000),
+                                f"upstream stream error: {exc}"[:300],
+                                0, 0, kid, klabel, provider, thinking)
+                        return jsonify({"error": {"message": f"upstream stream error: {exc}",
+                                                  "type": "server_error"}}), 502
+                    u = j.get("usage", {}) or {}
+                    thinking = thinking or bool(
+                        ((j.get("choices") or [{}])[0].get("message") or {}).get("reasoning_content"))
+                    add_log(ep, router_model, True, int((time.time() - t0) * 1000), "",
+                            int(u.get("prompt_tokens", 0) or 0),
+                            int(u.get("completion_tokens", 0) or 0),
+                            kid, klabel, provider, thinking)
+                    return jsonify(j)
                 j = resp.json()
                 j["model"] = router_model
                 u = j.get("usage", {}) or {}
@@ -2537,11 +3859,15 @@ def create_app() -> Flask:
                 abody, thinking_req = openai_to_anthropic_body(body, default_system)
                 thinking = thinking or thinking_req
                 abody["model"] = upstream
+                apply_thinking_default(
+                    abody, "anthropic",
+                    get_provider_settings(data, target.get("provider_id") or "").get("thinking"))
                 # upstream Anthropic SSE cannot be converted to OpenAI SSE; buffer and
                 # fake-stream it (correct but delayed)
                 _entry, resp = call_upstream(
                     "anthropic", abody, stream=False, timeout=60,
-                    extra_headers=_forward_anthropic_beta())
+                    extra_headers=forward_beta,
+                    provider=target.get("provider_id") or "")
                 if resp.status_code != 200:
                     add_log(ep, router_model, False, int((time.time() - t0) * 1000),
                             _cross_error_message("anthropic", resp),
@@ -2575,6 +3901,12 @@ def create_app() -> Flask:
             if isinstance(body.get("reasoning_effort"), str):
                 budget = budget_for_effort(body["reasoning_effort"])
                 thinking = True
+            _tmode = get_provider_settings(data, target.get("provider_id") or "").get("thinking")
+            if _tmode == "on" and budget is None:
+                budget = 4096
+                thinking = True
+            elif _tmode == "off":
+                budget = None
             payload = build_gemini_payload(
                 system_text, contents,
                 max_tokens=max_tokens,
@@ -2587,7 +3919,8 @@ def create_app() -> Flask:
                 thinking_budget=budget,
                 include_thoughts=budget is not None,
             )
-            g = call_gemini(gemini_model, payload)
+            g = call_gemini(gemini_model, payload,
+                             provider=target.get("provider_id") or "")
             oai = gemini_to_openai_response(g, router_model)
             u = (oai.get("usage") or {})
             thinking = thinking or bool(
@@ -2608,6 +3941,23 @@ def create_app() -> Flask:
                     int((time.time() - t0) * 1000), str(exc),
                     0, 0, kid, klabel, "", thinking)
             return jsonify({"error": str(exc)[:500]}), 502
+
+    @app.post("/v1/chat/completions")
+    def chat_completions():
+        ok, err, key_info = need_router_auth()
+        if not ok:
+            return err  # type: ignore[return-value]
+        body = request.get_json(force=True, silent=True) or {}
+        return _chat_core(body, key_info, "openai:/v1/chat/completions",
+                          _forward_anthropic_beta())
+
+    @app.post("/admin/api/playground/chat")
+    def admin_playground_chat():
+        if (err := need_admin_auth()) is not None:
+            return err
+        body = request.get_json(force=True, silent=True) or {}
+        return _chat_core(body, {"id": "playground", "label": "playground"},
+                          "playground", {})
 
     # --- Router: Anthropic compatible ---
     @app.post("/v1/messages")
@@ -2644,10 +3994,14 @@ def create_app() -> Flask:
                     abody.pop("system", None)
                 abody["messages"] = sanitize_anthropic_messages_for_upstream(
                     body.get("messages", []))
+                apply_thinking_default(
+                    abody, "anthropic",
+                    get_provider_settings(data, target.get("provider_id") or "").get("thinking"))
                 _entry, resp = call_upstream(
                     "anthropic", abody, stream=stream,
                     timeout=STREAM_TIMEOUT if stream else 60,
-                    extra_headers=_forward_anthropic_beta())
+                    extra_headers=_forward_anthropic_beta(),
+                    provider=target.get("provider_id") or "")
                 if resp.status_code != 200:
                     add_log(ep, router_model, False, int((time.time() - t0) * 1000),
                             _cross_error_message("anthropic", resp),
@@ -2672,9 +4026,16 @@ def create_app() -> Flask:
             if provider == "openai":
                 obody, _effort = anthropic_to_openai_body(body, default_system)
                 obody["model"] = upstream
+                apply_thinking_default(
+                    obody, "openai",
+                    get_provider_settings(data, target.get("provider_id") or "").get("thinking"))
                 # upstream OpenAI SSE cannot be converted to Anthropic SSE; buffer it
-                _entry, resp = call_upstream("openai", obody, stream=False, timeout=60)
-                if resp.status_code == 400:
+                oc: dict = {}
+                _entry, resp = call_upstream("openai", obody, stream=False, timeout=60,
+                                        provider=target.get("provider_id") or "",
+                                        oc_state=oc)
+                oc_streamed = bool(oc.get("forced_stream"))
+                if resp.status_code == 400 and not oc_streamed:
                     # Strict gateways (opencode zen, Ollama, vLLM) reject
                     # reasoning_effort / temperature / max_tokens variants with
                     # a generic 400. Retry once with a sanitized payload.
@@ -2682,7 +4043,8 @@ def create_app() -> Flask:
                     if removed:
                         _close_quietly(resp)
                         _entry2, resp2 = call_upstream(
-                            "openai", retry_body, stream=False, timeout=60)
+                            "openai", retry_body, stream=False, timeout=60,
+                            provider=target.get("provider_id") or "")
                         if resp2.status_code == 200:
                             resp = resp2
                             _entry = _entry2
@@ -2707,7 +4069,9 @@ def create_app() -> Flask:
                     return jsonify({"type": "error", "error": {
                         "type": "api_error",
                         "message": msg}}), resp.status_code
-                anth = openai_response_to_anthropic(resp.json(), router_model)
+                oai_json = (aggregate_openai_sse(resp, router_model, oc.get("rename"))
+                            if oc_streamed else resp.json())
+                anth = openai_response_to_anthropic(oai_json, router_model)
                 thinking = thinking or any(
                     isinstance(b, dict) and b.get("type") == "thinking"
                     for b in anth.get("content", []) or [])
@@ -2728,6 +4092,12 @@ def create_app() -> Flask:
             gemini_model = upstream
             thinking_on, budget = anthropic_thinking_of_body(body)
             thinking = thinking or thinking_on
+            _tmode = get_provider_settings(data, target.get("provider_id") or "").get("thinking")
+            if _tmode == "on" and not thinking_on:
+                thinking_on, budget = True, 4096
+                thinking = True
+            elif _tmode == "off":
+                thinking_on, budget = False, None
             client_system, contents = anthropic_messages_to_gemini(
                 body.get("system"), body.get("messages", [])
             )
@@ -2748,7 +4118,8 @@ def create_app() -> Flask:
                 thinking_budget=budget if thinking_on else None,
                 include_thoughts=thinking_on,
             )
-            g = call_gemini(gemini_model, payload)
+            g = call_gemini(gemini_model, payload,
+                             provider=target.get("provider_id") or "")
             anth = gemini_to_anthropic_response(g, router_model,
                                                 thinking_enabled=thinking_on)
             u = (anth.get("usage") or {})
@@ -2803,7 +4174,11 @@ def create_app() -> Flask:
             target = resolve_target(data, model_name)
             provider, upstream = target["provider"], target["upstream_model"]
             if provider == "gemini":
-                g = call_gemini(upstream, body or {"contents": []})
+                apply_thinking_default(
+                    body, "gemini",
+                    get_provider_settings(data, target.get("provider_id") or "").get("thinking"))
+                g = call_gemini(upstream, body or {"contents": []},
+                                 provider=target.get("provider_id") or "")
                 inp, out = _gemini_usage_of_response(g)
                 add_log(ep, model_name, True, int((time.time() - t0) * 1000), "",
                         inp, out, kid, klabel, provider, thinking)
@@ -2813,7 +4188,8 @@ def create_app() -> Flask:
             obody = gemini_request_to_openai(body or {"contents": []})
             obody["model"] = upstream
             if provider == "openai":
-                _entry, resp = call_upstream("openai", obody, stream=False, timeout=60)
+                _entry, resp = call_upstream("openai", obody, stream=False, timeout=60,
+                                        provider=target.get("provider_id") or "")
                 if resp.status_code != 200:
                     add_log(ep, model_name, False, int((time.time() - t0) * 1000),
                             _cross_error_message("openai", resp),
@@ -2826,7 +4202,8 @@ def create_app() -> Flask:
                 abody["model"] = upstream
                 _entry, resp = call_upstream(
                     "anthropic", abody, stream=False, timeout=60,
-                    extra_headers=_forward_anthropic_beta())
+                    extra_headers=_forward_anthropic_beta(),
+                    provider=target.get("provider_id") or "")
                 if resp.status_code != 200:
                     add_log(ep, model_name, False, int((time.time() - t0) * 1000),
                             _cross_error_message("anthropic", resp),
@@ -2859,5 +4236,5 @@ def create_app() -> Flask:
 app = create_app()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
+    port = int(os.environ.get("PORT", "20003"))
     app.run(host="0.0.0.0", port=port, debug=True)

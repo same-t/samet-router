@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Samet Router · Provider</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div class="layout">
+  {% set sidebar_mode = 'links' %}
+  {% include "_sidebar.html" %}
+
+  <main class="content prov-page">
+    <a class="back-link" href="/admin?tab=providers">← Back to Providers</a>
+
+    <div class="prov-detail-head">
+      <span class="prov-detail-ico" id="pd-ico"></span>
+      <div class="prov-detail-meta">
+        <h1 id="pd-name">Provider</h1>
+        <div id="pd-count" class="prov-detail-sub">0 connections</div>
+      </div>
+    </div>
+
+    <section class="pd-card">
+      <div class="pd-auth">
+        <span class="pd-lock" id="pd-lock"></span>
+        <div>
+          <div class="pd-auth-title" id="pd-auth-title">Loading…</div>
+          <div class="pd-auth-desc" id="pd-auth-desc"></div>
+        </div>
+      </div>
+
+      <div class="pd-field">
+        <label class="fld">Proxy Pool</label>
+        <select id="pd-proxy-pool"></select>
+      </div>
+
+      <div class="pd-field">
+        <label class="fld">Rotation Strategy</label>
+        <select id="pd-rotation">
+          <option value="none">None (single pool)</option>
+          <option value="round_robin">Round Robin</option>
+          <option value="random">Random</option>
+        </select>
+        <p class="hint">Rotasyon için en az 2 aktif proxy havuzu gerekir.
+          <a href="/admin?tab=proxies">Manage pools →</a></p>
+      </div>
+    </section>
+
+    <section class="pd-collapse">
+      <button type="button" class="pd-collapse-head" onclick="toggleHeaders()">
+        <span class="pd-collapse-title">⚙ Custom Headers</span>
+        <span class="badge-soft hidden" id="pd-headers-badge">Active</span>
+        <span class="chev">▾</span>
+      </button>
+      <div class="pd-collapse-body hidden" id="pd-headers-body">
+        <div id="pd-headers-list"></div>
+        <div class="row">
+          <button type="button" class="ghost" onclick="addHeaderRow()">＋ Add header</button>
+          <button type="button" onclick="saveHeaders()">Save headers</button>
+        </div>
+        <label class="switch">
+          <span>Send these headers upstream</span>
+          <input type="checkbox" id="pd-headers-active" />
+          <span class="track"><span class="thumb"></span></span>
+        </label>
+      </div>
+    </section>
+
+    <section class="pd-card">
+      <div class="conn-top">
+        <h3>Connections</h3>
+        <label class="switch">
+          <span>Round Robin</span>
+          <input type="checkbox" id="rr-toggle" onchange="toggleRoundRobin()" />
+          <span class="track"><span class="thumb"></span></span>
+        </label>
+      </div>
+      <div class="conn-body">
+        <div class="conn-left" id="conn-left"></div>
+        <div class="conn-right">
+          <button type="button" class="btn-connect hidden" id="oc-connect-btn" onclick="connectOpencode()">Connect OpenCode account</button>
+          <button type="button" class="btn-add" onclick="openAddConn()"><span class="plus">＋</span> Add Connection</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="pd-card">
+      <div class="pd-models-head">
+        <h3>Available Models</h3>
+        <label class="inline-lab">Thinking
+          <select id="pd-thinking" onchange="saveSetting('thinking', this.value)">
+            <option value="auto">Auto</option>
+            <option value="on">On</option>
+            <option value="off">Off</option>
+          </select>
+        </label>
+        <button type="button" class="ghost" onclick="disableAllModels()">⊘ Disable All</button>
+      </div>
+      <div class="pd-models-grid" id="pd-models"></div>
+      <div class="pd-models-foot">
+        <div class="pd-suggest-title">Suggested free models</div>
+        <div class="pd-suggest-chips" id="pd-suggest"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="conn-modal" class="modal-backdrop hidden">
+  <div class="modal wide">
+    <div class="modal-head">
+      <span class="dots"><i class="dot red"></i><i class="dot yellow"></i><i class="dot green"></i></span>
+      <span id="conn-modal-title">Add Connection</span>
+    </div>
+    <div class="modal-tabs">
+      <button class="mtab active" data-mtab="single" onclick="switchConnTab('single')">Single</button>
+      <button class="mtab" data-mtab="bulk" onclick="switchConnTab('bulk')">Bulk Add</button>
+    </div>
+
+    <div id="conn-single-block">
+      <label class="fld">Name</label>
+      <input id="conn-name" placeholder="Production Key" />
+      <label class="fld">API Key</label>
+      <div class="inline-row">
+        <input id="conn-key" placeholder="public or sk-..." />
+        <button class="btn-check" onclick="checkConnKey()">Check</button>
+      </div>
+      <div id="conn-check-msg" class="check-msg hidden"></div>
+      <label class="fld">Priority</label>
+      <input id="conn-priority" type="number" min="1" value="1" />
+      <label class="fld">Proxy Pool</label>
+      <select id="conn-proxy"><option value="none">None</option></select>
+    </div>
+
+    <div id="conn-bulk-block" class="hidden">
+      <label class="fld">API Keys (one per line)</label>
+      <textarea id="conn-bulk-keys" rows="5" placeholder="public&#10;sk-..."></textarea>
+      <label class="fld">Priority</label>
+      <input id="conn-bulk-priority" type="number" min="1" value="1" />
+      <label class="fld">Proxy Pool</label>
+      <select id="conn-bulk-proxy"><option value="none">None</option></select>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn-save" onclick="saveConn()">Save</button>
+      <button class="btn-cancel" onclick="closeAddConn()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="oc-modal" class="modal-backdrop hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <span class="dots"><i class="dot red"></i><i class="dot yellow"></i><i class="dot green"></i></span>
+      <span>Connect OpenCode account</span>
+    </div>
+    <p class="hint">Linki açıp kodu onaylayın. Bu pencere otomatik olarak güncellenir.</p>
+    <a id="oc-link" class="oc-link" href="#" target="_blank" rel="noopener"></a>
+    <label class="fld">Code</label>
+    <div class="oc-code" id="oc-code">—</div>
+    <div id="oc-status" class="check-msg hidden"></div>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeOpencode()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const PID = "{{ provider_id }}";
+const $ = id => document.getElementById(id);
+function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+const PD_LOGO = '<svg viewBox="0 0 24 24" width="26" height="26" fill="none"><rect x="3" y="4.5" width="18" height="15" rx="4" stroke="currentColor" stroke-width="1.7"/><rect x="8" y="9.5" width="8" height="5" rx="1.2" fill="currentColor"/></svg>';
+const PD_LOGOS = {
+  openai: '<svg viewBox="0 0 24 24" width="26" height="26" fill="none"><circle cx="12" cy="12" r="8.5" stroke="currentColor" stroke-width="1.7"/><path d="M9 15V9l6 6V9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  anthropic: '<svg viewBox="0 0 24 24" width="26" height="26" fill="none"><path d="M7 4v16M17 4v16M7 12h10" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
+  gemini: '<svg viewBox="0 0 24 24" width="26" height="26" fill="none"><path d="M12 3l1.9 5.6L19.5 10l-5.6 1.9L12 17.5l-1.9-5.6L4.5 10l5.6-1.4z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>',
+  commandcode: '<svg viewBox="0 0 24 24" width="26" height="26" fill="none"><rect x="3" y="4.5" width="18" height="15" rx="4" stroke="currentColor" stroke-width="1.7"/><path d="M8.5 10l-2 2 2 2M15.5 10l2 2-2 2M13 9l-2 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  custom: '<svg viewBox="0 0 24 24" width="26" height="26" fill="none"><circle cx="12" cy="12" r="3.2" stroke="currentColor" stroke-width="1.7"/><path d="M12 3.5v3M12 17.5v3M3.5 12h3M17.5 12h3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
+};
+function pdLogo(pid) { return PD_LOGOS[pid] || PD_LOGO; }
+function pdSuggestTitle(pid) {
+  return pid === 'opencode' ? 'Suggested free models'
+       : pid === 'commandcode' ? 'Suggested models' : 'Suggested models';
+}
+const PD_LOCK = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none"><rect x="5" y="10.5" width="14" height="9" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5" stroke="currentColor" stroke-width="1.6"/></svg>';
+let P = null;
+let CONN_TAB = 'single';
+
+async function load() {
+  const r = await fetch('/admin/api/providers/' + encodeURIComponent(PID));
+  if (!r.ok) { $('pd-auth-title').textContent = 'Provider not found'; return; }
+  const d = await r.json();
+  P = d;
+  const logo = pdLogo(d.id);
+  $('pd-ico').innerHTML = logo;
+  $('pd-name').textContent = d.name;
+  $('pd-count').textContent = `${d.count} connection${d.count === 1 ? '' : 's'}`;
+  $('pd-lock').innerHTML = d.auth_required ? PD_LOCK : '';
+  $('pd-auth-title').textContent = d.auth_required ? 'Authentication required' : 'No authentication required';
+  $('pd-auth-desc').textContent = d.auth_required
+    ? 'Bu sağlayıcı bir API anahtarı gerektirir. Aşağıdan bağlantı ekleyin.'
+    : 'Bu sağlayıcı hazır kullanılabilir. İsterseniz anahtar ekleyip öncelik/pool atayabilirsiniz.';
+
+  const sel = $('pd-proxy-pool');
+  sel.innerHTML = '<option value="none">None (direct)</option>' +
+    (d.pools || []).map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+  sel.value = d.settings.proxy_pool || 'none';
+  sel.onchange = () => saveSetting('proxy_pool', sel.value);
+
+  $('pd-rotation').value = d.settings.rotation || 'none';
+  $('pd-rotation').onchange = e => saveSetting('rotation', e.target.value);
+  $('pd-thinking').value = d.settings.thinking || 'auto';
+
+  $('pd-headers-active').checked = !!d.settings.headers_active;
+  renderHeaders(d.settings.custom_headers || []);
+  $('pd-headers-badge').classList.toggle('hidden',
+    !(d.settings.headers_active && (d.settings.custom_headers || []).length));
+
+  renderConnections(d.connections || []);
+  renderModels(d.models || [], d.short, d.id);
+  renderSuggestions(d.suggestions || []);
+  document.querySelector('.pd-suggest-title').textContent = pdSuggestTitle(d.id);
+  $('oc-connect-btn').classList.toggle('hidden', PID !== 'opencode');
+
+  try {
+    const st = await fetch('/admin/api/state').then(x => x.json());
+    if (st && st.settings) $('rr-toggle').checked = st.settings.round_robin !== false;
+  } catch (e) {}
+}
+
+function renderConnections(conns) {
+  if (!conns.length) {
+    $('conn-left').innerHTML = `<div class="conn-empty"><span class="conn-lock">${PD_LOCK}</span> No connections yet</div>`;
+    return;
+  }
+  $('conn-left').innerHTML = conns.map(k => {
+    const isOauth = k.auth_type === 'oauth';
+    const acct = k.account || {};
+    const sub = isOauth ? (acct.email || acct.org_name || '') : '';
+    return `
+    <div class="conn-item">
+      <span class="conn-dot"></span>
+      <span class="conn-label">${esc(k.label)}</span>
+      ${isOauth
+        ? '<span class="badge-soft">account</span>'
+        : `<code class="conn-key">${esc(k.key)}</code>`}
+      ${sub ? `<span class="conn-meta">${esc(sub)}</span>` : ''}
+      <span class="conn-meta">prio ${k.priority ?? 1}</span>
+      <button class="conn-del" onclick="delConnection('${k.id}')">Delete</button>
+    </div>`;
+  }).join('');
+}
+async function delConnection(id) {
+  await fetch('/admin/api/provider-keys/' + id, { method: 'DELETE' });
+  load();
+}
+
+let OC_TIMER = null;
+function closeOpencode() {
+  clearTimeout(OC_TIMER); OC_TIMER = null;
+  $('oc-modal').classList.add('hidden');
+}
+async function connectOpencode() {
+  clearTimeout(OC_TIMER);
+  const st = $('oc-status');
+  const r = await fetch('/admin/api/providers/opencode/opencode/connect/start', { method: 'POST' });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.device_code) { alert('error: ' + (j.error || 'device code unavailable')); return; }
+  const link = j.verification_uri_complete || j.verification_uri || '';
+  $('oc-link').href = link || '#';
+  $('oc-link').textContent = link || '(link unavailable)';
+  $('oc-code').textContent = j.user_code || '—';
+  st.className = 'check-msg';
+  st.textContent = 'Waiting for approval…';
+  st.classList.remove('hidden');
+  $('oc-modal').classList.remove('hidden');
+  let wait = Math.max(2, j.interval || 5) * 1000;
+  const step = async () => {
+    const pr = await fetch('/admin/api/providers/opencode/opencode/connect/poll', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device_code: j.device_code }),
+    });
+    const pj = await pr.json().catch(() => ({}));
+    if (pj.status === 'complete') {
+      clearTimeout(OC_TIMER); OC_TIMER = null;
+      st.className = 'check-msg ok'; st.textContent = '✓ Connected';
+      setTimeout(closeOpencode, 700);
+      load();
+      return;
+    }
+    if (pj.status === 'pending') { st.textContent = 'Waiting for approval…'; }
+    else if (pj.status === 'slow_down') { wait = Math.min(wait + 5000, 20000); st.textContent = 'Slowing down…'; }
+    else if (pj.status === 'expired') { st.className = 'check-msg err'; st.textContent = 'Code expired. Close and retry.'; return; }
+    else { st.className = 'check-msg err'; st.textContent = 'Error: ' + (pj.message || pj.status || ''); return; }
+    OC_TIMER = setTimeout(step, wait);
+  };
+  step();
+}
+async function toggleRoundRobin() {
+  await fetch('/admin/api/settings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ round_robin: $('rr-toggle').checked }),
+  });
+}
+
+function renderHeaders(list) {
+  $('pd-headers-list').innerHTML = list.length
+    ? list.map(h => headerRow(h)).join('')
+    : '<p class="hint">No custom headers.</p>';
+}
+function headerRow(h) {
+  h = h || { name: '', value: '', enabled: true };
+  return `<div class="hdr-row">
+    <input class="hdr-name" placeholder="Header" value="${esc(h.name || '')}" />
+    <input class="hdr-val" placeholder="value" value="${esc(h.value || '')}" />
+    <label class="hdr-en"><input type="checkbox" ${h.enabled !== false ? 'checked' : ''}/> on</label>
+    <button type="button" class="ghost" onclick="this.parentElement.remove()">✕</button>
+  </div>`;
+}
+function addHeaderRow() {
+  if ($('pd-headers-list').querySelector('.hint')) $('pd-headers-list').innerHTML = '';
+  $('pd-headers-list').insertAdjacentHTML('beforeend', headerRow());
+}
+function toggleHeaders() { $('pd-headers-body').classList.toggle('hidden'); }
+async function saveHeaders() {
+  const rows = [...$('pd-headers-list').querySelectorAll('.hdr-row')].map(r => ({
+    name: r.querySelector('.hdr-name').value.trim(),
+    value: r.querySelector('.hdr-val').value,
+    enabled: r.querySelector('.hdr-en input').checked,
+  })).filter(h => h.name);
+  await saveSetting('custom_headers', rows, true);
+  await saveSetting('headers_active', $('pd-headers-active').checked, true);
+  $('pd-headers-badge').classList.toggle('hidden',
+    !($('pd-headers-active').checked && rows.length));
+}
+
+function renderModels(models, short, pid) {
+  const cards = models.map(m => {
+    const rid = `${short}/${m.upstream_model}`;
+    return `<div class="model-card${m.disabled ? ' off' : ''}">
+      <span class="model-ico">${pdLogo(pid)}</span>
+      <span class="model-info">
+        <span class="model-id">${esc(rid)}</span>
+        <span class="model-sub">${esc(m.upstream_model)}${m.disabled ? ' · disabled' : ''}</span>
+      </span>
+      <span class="model-actions">
+        <button type="button" title="Copy" onclick="copyText('${esc(rid)}')">⧉</button>
+        <button type="button" title="Delete" class="danger" onclick="delModel('${esc(m.name)}')">✕</button>
+      </span>
+    </div>`;
+  }).join('');
+  $('pd-models').innerHTML = cards + `
+    <button type="button" class="model-card add" onclick="addModel()">
+      <span class="plus">＋</span> Add Model
+    </button>`;
+}
+function encName(n) { return encodeURIComponent(n).replace(/%2F/g, '/'); }
+async function addModel() {
+  const up = prompt('Upstream model id (ör. mimo-v2.6-flash-free):');
+  if (!up || !up.trim()) return;
+  const r = await fetch('/admin/api/providers/' + encodeURIComponent(PID) + '/models', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ upstream_model: up.trim() }),
+  });
+  if (!r.ok) return alert('error: ' + await r.text());
+  load();
+}
+async function delModel(name) {
+  await fetch('/admin/api/providers/' + encodeURIComponent(PID) + '/models/' + encName(name), { method: 'DELETE' });
+  load();
+}
+async function disableAllModels() {
+  const r = await fetch('/admin/api/providers/' + encodeURIComponent(PID) + '/models/disable-all', { method: 'POST' });
+  if (r.ok) load();
+}
+function renderSuggestions(list) {
+  $('pd-suggest').innerHTML = list.length
+    ? list.map(s => `<button type="button" class="chip" onclick="addSuggested('${esc(s)}')">＋ ${esc(s)}</button>`).join('')
+    : '<span class="hint">no suggestions</span>';
+}
+async function addSuggested(up) {
+  const r = await fetch('/admin/api/providers/' + encodeURIComponent(PID) + '/models', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ upstream_model: up }),
+  });
+  if (r.ok) load();
+}
+function copyText(t) {
+  navigator.clipboard?.writeText(t).then(() => alert('copied')).catch(() => prompt('Copy:', t));
+}
+async function saveSetting(key, value, quiet) {
+  const r = await fetch('/admin/api/providers/' + encodeURIComponent(PID) + '/settings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ [key]: value }),
+  });
+  if (!r.ok && !quiet) alert('error: ' + await r.text());
+}
+
+function fillPoolSelects() {
+  const opts = '<option value="none">None</option>' +
+    ((P && P.pools) || []).map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+  ['conn-proxy', 'conn-bulk-proxy'].forEach(id => {
+    const s = $(id);
+    if (s) { const v = s.value; s.innerHTML = opts; s.value = v; }
+  });
+}
+function openAddConn() {
+  $('conn-name').value = '';
+  $('conn-key').value = '';
+  $('conn-priority').value = '1';
+  $('conn-bulk-keys').value = '';
+  $('conn-bulk-priority').value = '1';
+  $('conn-check-msg').classList.add('hidden');
+  fillPoolSelects();
+  $('conn-modal').classList.remove('hidden');
+  switchConnTab('single');
+}
+function closeAddConn() { $('conn-modal').classList.add('hidden'); }
+function switchConnTab(tab) {
+  CONN_TAB = tab;
+  document.querySelectorAll('.mtab').forEach(b => b.classList.toggle('active', b.dataset.mtab === tab));
+  $('conn-single-block').classList.toggle('hidden', tab !== 'single');
+  $('conn-bulk-block').classList.toggle('hidden', tab !== 'bulk');
+}
+async function checkConnKey() {
+  const key = $('conn-key').value.trim();
+  const msg = $('conn-check-msg');
+  msg.classList.remove('hidden');
+  msg.className = 'check-msg';
+  msg.textContent = 'checking…';
+  const r = await fetch('/admin/api/provider-keys/check', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key, provider: PID }),
+  });
+  const j = await r.json();
+  msg.textContent = (j.ok ? '✓ ' : '✕ ') + (j.message || ('status ' + j.status));
+  msg.classList.add(j.ok ? 'ok' : 'err');
+}
+async function saveConn() {
+  if (CONN_TAB === 'bulk') {
+    const keys = $('conn-bulk-keys').value.split('\n').map(s => s.trim()).filter(Boolean);
+    if (!keys.length) return alert('enter at least one key');
+    const priority = $('conn-bulk-priority').value || 1;
+    const proxy_pool = $('conn-bulk-proxy').value;
+    for (const key of keys) {
+      const r = await fetch('/admin/api/provider-keys', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, label: 'Connection', provider: PID, priority, proxy_pool }),
+      });
+      if (!r.ok) alert('error: ' + await r.text());
+    }
+  } else {
+    const key = $('conn-key').value.trim();
+    if (!key) return alert('enter a key');
+    const body = {
+      key, label: $('conn-name').value.trim() || 'Connection',
+      provider: PID, priority: $('conn-priority').value || 1,
+      proxy_pool: $('conn-proxy').value,
+    };
+    const r = await fetch('/admin/api/provider-keys', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) return alert('error: ' + await r.text());
+  }
+  closeAddConn();
+  load();
+}
+
+load();
+</script>
+</body>
+</html>

@@ -5,7 +5,7 @@ Multi-provider, **OpenAI / Anthropic / Gemini compatible** mini LLM router + adm
 ```
 Client (OpenAI SDK / Anthropic SDK / ham REST)
    → Samet Router (Flask, bu repo)
-   → Upstream: OpenAI / Anthropic / Gemini / OpenAI-uyumlu custom sunucu
+   → Upstream: OpenCode · OpenAI · Anthropic · Gemini · Command Code / OpenAI-uyumlu custom sunucu
 ```
 
 For each **provider key**, configure the provider (whose key it is), the protocol (which format is spoken:
@@ -20,17 +20,21 @@ and model/key/endpoint/provider/daily breakdowns.
 ```powershell
 pip install -r requirements.txt
 python app.py
-# http://localhost:8000/admin
+# http://localhost:20003/admin
 ```
 
-1. In `/admin` → **Provider Keys** tab, add an upstream key:
+1. In `/admin` → **Providers** tab, pick a provider and add an upstream key:
+   - `provider=opencode` → OpenCode Zen (public or `sk-...`), protocol `openai`
    - `provider=openai` → OpenAI key (`sk-...`), protocol `openai`
    - `provider=anthropic` → Anthropic key (`sk-ant-...`), protocol `anthropic`
    - `provider=gemini` → Google AI Studio key (`AIza...`), protocol `gemini`
+   - `provider=commandcode` → Command Code API key
+     (`https://api.commandcode.ai/provider/v1`), protocol `openai`
    - `provider=custom` + `base URL` → OpenAI-compatible servers such as
      Ollama / vLLM / DeepSeek / LM Studio (e.g. `http://localhost:11434/v1`)
 2. In the **Models** tab, map a router name → provider + upstream model
-   (e.g. `gpt-mini` → `openai`/`gpt-4o-mini`, `claude-alias` → `anthropic`/`claude-sonnet-4-5`).
+   (e.g. `gpt-mini` → `openai`/`gpt-4o-mini`, `claude-alias` → `anthropic`/`claude-sonnet-4-5`,
+   `ds-flash` → `commandcode`/`deepseek/deepseek-v4-flash`).
 3. In the **User Keys** tab, generate a separate key per user (`sk-samet-...`).
    The raw key is shown only at creation time — copy it immediately.
 4. Use that key in the client (`Authorization: Bearer ...` or `x-api-key: ...`).
@@ -51,6 +55,9 @@ python app.py
 | `GET/POST/DELETE /admin/api/...` | admin JSON API (including `/settings`, `/router-keys`, `/stats`) |
 | `GET /admin/api/providers` | provider catalog: protocol/base_url/auth defaults |
 | `POST /admin/api/provider-keys` | add upstream key (`{key, label, provider, protocol?, base_url?}`; `base_url` required for `custom`) |
+| `GET /admin/api/combos` | combos + the list of models a combo can point at |
+| `POST /admin/api/combos` | create/update a combo (`{name, model, description?}`); same name updates in place |
+| `DELETE /admin/api/combos/<name>` | delete a combo |
 | `DELETE /admin/api/provider-keys/<id>` | delete upstream key |
 | `GET /admin/api/stats` | dashboard summary: total/ok/err, success %, input/output/total tokens, avg. latency, thinking count, model/key/endpoint/provider/daily breakdown |
 | `DELETE /admin/api/stats` | reset statistics + logs |
@@ -63,7 +70,7 @@ python app.py
 # OpenAI compatible (api_key = the sk-samet-... key generated in the panel)
 # "gpt-mini" is mapped to openai/gpt-4o-mini under Models
 from openai import OpenAI
-c = OpenAI(base_url="http://localhost:8000/v1", api_key="sk-samet-...")
+c = OpenAI(base_url="http://localhost:20003/v1", api_key="sk-samet-...")
 r = c.chat.completions.create(model="gpt-mini",
     messages=[{"role": "user", "content": "Hello"}])
 print(r.choices[0].message.content, r.usage)
@@ -73,7 +80,7 @@ print(r.choices[0].message.content, r.usage)
 # Anthropic compatible (the format Claude Code uses)
 # "claude-alias" is mapped to anthropic/claude-sonnet-4-5 under Models
 import anthropic
-c = anthropic.Anthropic(base_url="http://localhost:8000", api_key="x")
+c = anthropic.Anthropic(base_url="http://localhost:20003", api_key="x")
 m = c.messages.create(model="claude-alias", max_tokens=200,
     system="Write briefly",
     messages=[{"role": "user", "content": "Hello"}],
@@ -85,7 +92,7 @@ print(m.content)
 ### Claude Code connection
 
 ```powershell
-$env:ANTHROPIC_BASE_URL = "http://localhost:8000"
+$env:ANTHROPIC_BASE_URL = "http://localhost:20003"
 $env:ANTHROPIC_AUTH_TOKEN = "sk-samet-..."   # key generated in the panel → User Keys
 $env:ANTHROPIC_MODEL = "claude-alias"        # alias bound to anthropic under Models in the panel
 claude
@@ -116,7 +123,7 @@ m = c.messages.create(model="claude-alias", max_tokens=2000,
 ```powershell
 # Gemini compatible (raw REST)
 Invoke-RestMethod -Method Post `
-  -Uri "http://localhost:8000/v1beta/models/samet-flash:generateContent" `
+  -Uri "http://localhost:20003/v1beta/models/samet-flash:generateContent" `
   -ContentType "application/json" `
   -Body '{"contents":[{"role":"user","parts":[{"text":"Hello"}]}]}'
 ```
@@ -125,7 +132,7 @@ Invoke-RestMethod -Method Post `
 
 | Variable | Description |
 |---|---|
-| `PORT` | default `8000` |
+| `PORT` | default `20003` |
 | `SAMET_ROUTER_DATA` | JSON data file path (default `./data.json`) |
 | `ROUTER_API_KEY` | optional single server key. If set **or** a user key exists in the panel, auth is required: `Authorization: Bearer ...` **or** `x-api-key: ...` (Claude Code sends `x-api-key`). If neither exists, it is open in local mode |
 | `ADMIN_TOKEN` | if set, `/admin/api/*` requires Bearer |
@@ -149,4 +156,8 @@ Tests do not send real requests to Gemini (`requests.post` is mocked).
 - System/user: Anthropic `system` (string or block list with `cache_control`), OpenAI `system/developer` roles, `image` blocks, and the default system prompt from `/admin` → **Prompt** tab are merged before sending (`default + client`).
 - `cache_control`, `metadata`, `top_p/top_k`, `stop_sequences` are either converted or silently ignored, never returning 400.
 - Old `data.json` files are migrated automatically (`gemini_keys` → provider key, `gemini_model` → provider/upstream mapping).
+- Command Code speaks both `/chat/completions` and `/messages` from one base URL, but a provider id maps to a single protocol (see `route_protocol_for_provider`), so `commandcode` is wired to `openai`. Its Claude models only answer on `/messages` and will 400 through this provider — map those aliases to `anthropic` instead, or add a per-model protocol override.
+- **OpenCode has two lanes.** Models ending in `-free` (or containing `:free`) use the keyless v2 free tier: `/inference/v1` + the v2 client fingerprint (`opencode/latest/<ver>/cli`, `x-opencode-session`/`-session-id`, verbatim `read`+`shell` tool schemas). Everything else stays on `/zen/v1` with the connection key. The free lane forces `stream:true` upstream, so non-streaming clients are served by aggregating the SSE response. A caller tool named `read`/`shell` is sent as `read_client`/`shell_client` to make room for the fingerprint pair, then renamed back in the response.
+- Model mappings pin to their own provider's keys. Keys are no longer pooled across providers that merely share a protocol (`opencode` and `commandcode` both speak `openai`).
+- **Combos** (`/admin` → Combos) give an existing model a second name. A combo points at exactly one model and shows up in `GET /v1/models` like any other id; `resolve_target` resolves the combo first, so it inherits the target's provider, settings and thinking config. Names are limited to letters, numbers, `.`, `_`, `-` (max 64) and may not collide with a model name or another combo.
 - This is a hobby/startup prototype; add auth + rate limiting + DB for production.

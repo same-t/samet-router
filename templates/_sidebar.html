@@ -1,0 +1,56 @@
+<aside class="sidebar">
+  <div class="brand">
+    <span class="logo">◈</span>
+    <span class="brand-text">
+      <span>Samet Router</span>
+      <span class="brand-ver">v1.0</span>
+    </span>
+  </div>
+  <nav>
+    {% if sidebar_mode|default('tabs') == 'links' %}
+      <div class="nav-group">
+        <div class="nav-group-label">Overview</div>
+        <a class="navlink" href="/admin?tab=dashboard">Dashboard</a>
+        <a class="navlink" href="/admin?tab=playground">Playground</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-label">Manage</div>
+        <a class="navlink" href="/admin?tab=providers">Providers</a>
+        <a class="navlink" href="/admin?tab=models">Models</a>
+        <a class="navlink" href="/admin?tab=combos">Combos</a>
+        <a class="navlink" href="/admin?tab=proxies">Proxies</a>
+        <a class="navlink" href="/admin?tab=router-keys">User Keys</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-label">System</div>
+        <a class="navlink" href="/admin?tab=prompt">Prompt</a>
+        <a class="navlink" href="/admin?tab=logs">Recent Requests</a>
+        <a class="navlink" href="/admin?tab=docs">Docs</a>
+      </div>
+    {% else %}
+      <div class="nav-group">
+        <div class="nav-group-label">Overview</div>
+        <button data-tab="dashboard" class="active">Dashboard</button>
+        <button data-tab="playground">Playground</button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-label">Manage</div>
+        <button data-tab="providers">Providers</button>
+        <button data-tab="models">Models</button>
+        <button data-tab="combos">Combos</button>
+        <button data-tab="proxies">Proxies</button>
+        <button data-tab="router-keys">User Keys</button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-label">System</div>
+        <button data-tab="prompt">Prompt</button>
+        <button data-tab="logs">Recent Requests</button>
+        <button data-tab="docs">Docs</button>
+      </div>
+    {% endif %}
+  </nav>
+  <div class="side-foot">
+    Backend: OpenCode · OpenAI · Anthropic · Gemini · Command Code<br/>
+    Compatible: OpenAI · Anthropic · Gemini
+  </div>
+</aside>
