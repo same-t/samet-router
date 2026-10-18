@@ -3,6 +3,8 @@ import json
 import tempfile
 from pathlib import Path
 
+import pytest
+
 import app as router
 
 
@@ -1317,6 +1319,333 @@ def test_combo_disabled_target_falls_back(tmp_path):
     still = c.get("/admin/api/combos").get_json()["combos"]
     assert still[0]["id"] == "samet"
     assert "samet" in [m["id"] for m in c.get("/v1/models").get_json()["data"]]
+
+
+# ---------------------------------------------------------------------------
+# SQLite storage layer
+# ---------------------------------------------------------------------------
+
+
+def test_store_roundtrip(tmp_path):
+    router.DATA_FILE = Path(tempfile.mkdtemp()) / "data.json"
+    data = router.default_data()
+    data["settings"]["default_system"] = "be brief"
+    data["settings"]["round_robin"] = False
+    data["stats"]["total_requests"] = 42
+    data["provider_keys"] = [{"id": "k1", "key": "sk-a", "provider": "openai",
+                              "protocol": "openai", "priority": 3}]
+    data["models"] = [{"name": "b-model", "provider": "gemini", "upstream_model": "g1"},
+                      {"name": "a-model", "provider": "gemini", "upstream_model": "g2"}]
+    data["combos"] = [{"id": "samet", "model": "a-model"}]
+    data["proxy_pools"] = [{"id": "p1", "name": "pool", "proxies": ["http://a:1"]}]
+    data["logs"] = [{"ts": "1", "model": "m", "ok": True},
+                    {"ts": "2", "model": "m", "ok": False, "error": "boom"}]
+    data["provider_index"] = {"openai:commandcode": 1}
+    data["provider_settings"] = {"commandcode": {"thinking": "on",
+                                                "custom_headers": [{"name": "a", "value": "b"}]}}
+    data["proxy_index"] = {"pool:p1": 3}
+    router.save_data(data)
+
+    # a fresh handle on the same path must see everything, order preserved
+    router._db_local.conns = {}
+    back = router.load_data()
+    assert back["settings"]["default_system"] == "be brief"
+    assert back["settings"]["round_robin"] is False
+    assert back["stats"]["total_requests"] == 42
+    assert back["provider_keys"][0]["priority"] == 3
+    assert [m["name"] for m in back["models"]] == ["b-model", "a-model"]
+    assert back["combos"][0]["id"] == "samet"
+    assert back["proxy_pools"][0]["proxies"] == ["http://a:1"]
+    assert [l["ts"] for l in back["logs"]] == ["1", "2"]
+    assert back["provider_index"] == {"openai:commandcode": 1}
+    assert back["provider_settings"]["commandcode"]["custom_headers"][0]["name"] == "a"
+    assert back["proxy_index"] == {"pool:p1": 3}
+
+
+def test_store_uses_sqlite_file(tmp_path):
+    router.DATA_FILE = Path(tempfile.mkdtemp()) / "data.json"
+    router.load_data()
+    dbp = router.db_path()
+    assert dbp.exists() and dbp.suffix == ".db"
+    # it must be a real sqlite database, not a json file renamed
+    assert dbp.read_bytes()[:15] == b"SQLite format 3"
+    # and the old json store must not be created any more
+    assert not router.DATA_FILE.exists()
+
+
+def test_store_imports_legacy_json(tmp_path):
+    base = Path(tempfile.mkdtemp())
+    router.DATA_FILE = base / "data.json"
+    router.DATA_FILE.write_text(json.dumps({
+        "settings": {"default_system": "legacy", "round_robin": False},
+        "models": [{"name": "old", "provider": "gemini", "upstream_model": "g-1"}],
+        "provider_keys": [{"id": "pk", "key": "AIza-LEGACY", "provider": "gemini",
+                           "protocol": "gemini"}],
+        "logs": [{"ts": "x", "model": "old", "ok": True}],
+    }), encoding="utf-8")
+    data = router.load_data()
+    assert data["settings"]["default_system"] == "legacy"
+    assert data["settings"]["round_robin"] is False
+    assert [m["name"] for m in data["models"]] == ["old"]
+    assert data["provider_keys"][0]["key"] == "AIza-LEGACY"
+    assert data["logs"][0]["ts"] == "x"
+    # original preserved as a backup, json replaced by sqlite
+    backup = base / "data.json.bak"
+    assert backup.exists() and json.loads(backup.read_text(encoding="utf-8"))
+    assert router.db_path().exists()
+    # a second load must come from sqlite, not the (now missing) json
+    router._db_local.conns = {}
+    again = router.load_data()
+    assert [m["name"] for m in again["models"]] == ["old"]
+
+
+def test_store_write_is_transactional(tmp_path):
+    """A failure mid-save must leave the previous state intact, not a partial one."""
+    router.DATA_FILE = Path(tempfile.mkdtemp()) / "data.json"
+    router.load_data()
+    good = router.load_data()
+    good["models"] = [{"name": "keeper", "provider": "gemini", "upstream_model": "g"}]
+    router.save_data(good)
+
+    bad = router.load_data()
+    # non-serialisable value -> executemany blows up after earlier tables were
+    # already DELETEd inside the same transaction, so the rollback is what keeps
+    # "keeper" alive.
+    bad["models"] = [{"name": "doomed", "provider": "gemini",
+                      "upstream_model": object()}]
+    with pytest.raises((TypeError, ValueError)):
+        router.save_data(bad)
+
+    router._db_local.conns = {}
+    after = router.load_data()
+    assert [m["name"] for m in after["models"]] == ["keeper"]
+
+
+def test_store_survives_concurrent_saves(tmp_path):
+    """Many threads writing at once must not corrupt the store."""
+    import threading as _t
+    router.DATA_FILE = Path(tempfile.mkdtemp()) / "data.json"
+    router.load_data()
+    errors = []
+
+    def worker(i):
+        try:
+            for _ in range(6):
+                with router._lock:
+                    d = router.load_data()
+                    d["logs"].append({"ts": str(i), "model": "m", "ok": True})
+                    router.save_data(d)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    ts = [_t.Thread(target=worker, args=(i,)) for i in range(6)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not errors, errors[:3]
+    router._db_local.conns = {}
+    logs = router.load_data()["logs"]
+    assert len(logs) == 36
+    assert all(isinstance(l, dict) and "ts" in l for l in logs)
+
+
+def test_admin_api_works_on_sqlite(tmp_path):
+    c = make_client(tmp_path)
+    assert c.post("/admin/api/keys", json={"key": "AIza-RT", "label": "rt"}).status_code == 201
+    assert c.post("/admin/api/provider-keys", json={
+        "key": "pk", "provider": "commandcode"}).status_code == 201
+    assert c.post("/admin/api/models", json={
+        "name": "m1", "provider": "commandcode", "upstream_model": "u"}).status_code == 201
+    assert c.post("/admin/api/combos", json={
+        "name": "samet", "model": "m1"}).status_code == 201
+    assert c.post("/admin/api/proxy-pools", json={
+        "name": "p", "proxies": ["http://a:1"]}).status_code == 201
+    # reopen against the same files: everything must still be there
+    app2 = router.create_app()
+    app2.config["TESTING"] = True
+    c2 = app2.test_client()
+    assert [m["id"] for m in c2.get("/v1/models").get_json()["data"]] == ["samet-flash", "samet-pro", "m1", "samet"]
+    assert len(c2.get("/admin/api/combos").get_json()["combos"]) == 1
+    assert c2.get("/admin/api/proxy-pools").get_json()[0]["name"] == "p"
+
+
+# ---------------------------------------------------------------------------
+# OpenCode catalog fetch + endpoint routing
+# ---------------------------------------------------------------------------
+
+CATALOG_RESPONSE = {"object": "list", "data": [
+    {"id": "space-bunny-free", "object": "model", "created": 1, "owned_by": "opencode"},
+    {"id": "deepseek-v4.1-flash-free", "object": "model", "created": 1, "owned_by": "opencode"},
+    {"id": "jev-1.13-free", "object": "model", "created": 1, "owned_by": "opencode"},
+    {"id": "muse-spark-1.2", "object": "model", "created": 1, "owned_by": "opencode"},
+    {"id": "big-pickle", "object": "model", "created": 1, "owned_by": "opencode"},
+]}
+
+
+def test_opencode_model_endpoint_map():
+    assert router.opencode_model_endpoint("space-bunny-free") == "chat"
+    assert router.opencode_model_endpoint("muse-spark-1.2") == "responses"
+    assert router.opencode_model_endpoint("jev-1.13-free") == "systemone"
+    # thinking suffix is stripped before lookup
+    assert router.opencode_model_endpoint("space-bunny-free(high)") == "chat"
+
+
+def test_opencode_endpoint_candidates_cover_chat_routes():
+    cands = router.opencode_endpoint_candidates("muse-spark-1.2")
+    assert cands[0] == "responses"
+    assert "chat" in cands and "messages" in cands
+    # a systemone model never falls back onto a chat route
+    assert router.opencode_endpoint_candidates("jev-1.13-free") == ["systemone"]
+
+
+def test_is_model_protocol_unsupported_detects_signal():
+    class R:
+        def __init__(self, code, payload):
+            self.status_code = code
+            self._p = payload
+
+        def json(self):
+            return self._p
+
+    assert router.is_model_protocol_unsupported(R(400, {
+        "type": "error", "error": {"type": "ModelProtocolUnsupported",
+                                   "message": "Model does not support this protocol."}}))
+    assert not router.is_model_protocol_unsupported(R(400, {
+        "error": {"message": "something else"}}))
+    assert not router.is_model_protocol_unsupported(R(429, {
+        "error": {"type": "ModelProtocolUnsupported"}}))
+
+
+def test_catalog_fetch_annotates_models(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    seen = {}
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return CATALOG_RESPONSE
+
+    def fake_get(url, **kw):
+        seen["url"] = url
+        return R()
+
+    monkeypatch.setattr(router.requests, "get", fake_get)
+    resp = c.post("/admin/api/providers/opencode/models/fetch")
+    assert resp.status_code == 200, resp.text
+    j = resp.get_json()
+    by = {m["id"]: m for m in j["models"]}
+    assert seen["url"].endswith("/inference/v1/models")
+    assert by["space-bunny-free"]["free"] is True
+    assert by["space-bunny-free"]["endpoint"] == "chat"
+    assert by["space-bunny-free"]["chat_compatible"] is True
+    assert by["big-pickle"]["free"] is False
+    assert by["big-pickle"]["lane"] == "paid"
+    assert by["jev-1.13-free"]["endpoint"] == "systemone"
+    assert by["jev-1.13-free"]["chat_compatible"] is False
+    assert by["muse-spark-1.2"]["endpoint"] == "responses"
+    assert j["free"] == 3
+    assert j["chat"] == 4
+    # nothing added yet -> all flagged as not-added
+    assert not any(m["added"] for m in j["models"])
+
+
+def test_catalog_fetch_marks_already_added(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    assert c.post("/admin/api/provider-keys", json={
+        "key": "oc", "provider": "opencode"}).status_code == 201
+    assert c.post("/admin/api/providers/opencode/models", json={
+        "upstream_model": "space-bunny-free"}).status_code == 201
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return CATALOG_RESPONSE
+
+    monkeypatch.setattr(router.requests, "get", lambda *a, **k: R())
+    j = c.post("/admin/api/providers/opencode/models/fetch").get_json()
+    by = {m["id"]: m for m in j["models"]}
+    assert by["space-bunny-free"]["added"] is True
+    assert by["deepseek-v4.1-flash-free"]["added"] is False
+    # a model added under another provider must not count as added here
+    assert by["big-pickle"]["added"] is False
+
+
+def test_catalog_fetch_rejects_other_providers(tmp_path):
+    c = make_client(tmp_path)
+    r = c.post("/admin/api/providers/commandcode/models/fetch")
+    assert r.status_code == 400
+    assert "not implemented" in r.get_json()["error"]
+
+
+def test_catalog_fetch_reports_upstream_failure(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+
+    class R:
+        status_code = 500
+        text = "boom"
+
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(router.requests, "get", lambda *a, **k: R())
+    r = c.post("/admin/api/providers/opencode/models/fetch")
+    assert r.status_code == 502
+    assert "no models" in r.get_json()["error"]
+
+
+def test_free_lane_falls_back_when_endpoint_rejected(tmp_path, monkeypatch):
+    """A model upstream says does not support this protocol is retried elsewhere."""
+    c = make_client(tmp_path)
+    c.post("/admin/api/provider-keys", json={
+        "key": "oc", "provider": "opencode"})
+    c.post("/admin/api/models", json={
+        "name": "sparky", "provider": "opencode",
+        "upstream_model": "muse-spark-1.2-free"})
+
+    class Unsupported:
+        status_code = 400
+        text = "no"
+
+        def json(self):
+            return {"type": "error", "error": {
+                "type": "ModelProtocolUnsupported",
+                "message": "Model does not support this protocol."}}
+
+    class Ok:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return fake_openai_chat("fell-back")
+
+    hits = []
+    monkeypatch.setattr(router.requests, "post",
+                        lambda url, **kw: (hits.append(url), Unsupported() if len(hits) == 1 else Ok())[1])
+    r = c.post("/v1/chat/completions", json={
+        "model": "sparky", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    assert r.get_json()["choices"][0]["message"]["content"] == "fell-back"
+    # the "muse-spark" hint routes to /responses first, then walks to /chat
+    assert hits[0].endswith("/inference/v1/responses"), hits
+    assert hits[1].endswith("/inference/v1/chat/completions"), hits
+    assert len(hits) == 2, hits
+
+
+def test_systemone_model_refused_with_clear_error(tmp_path):
+    """A System One model cannot be proxied through /v1/chat; say so plainly."""
+    c = make_client(tmp_path)
+    c.post("/admin/api/provider-keys", json={"key": "pub", "provider": "opencode"})
+    c.post("/admin/api/providers/opencode/models", json={
+        "upstream_model": "jev-1.13-free"})
+    r = c.post("/v1/chat/completions", json={
+        "model": "oc/jev-1.13-free", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 400
+    err = r.get_json()["error"]
+    assert err["code"] == "systemone_model"
+    assert "systemone" in err["message"]
 
 
 def test_aggregate_openai_sse_builds_json():

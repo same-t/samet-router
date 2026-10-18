@@ -47,6 +47,7 @@ import os
 import random
 import re
 import secrets
+import sqlite3
 import threading
 import time
 import uuid
@@ -141,18 +142,185 @@ def default_data() -> dict:
     }
 
 
-def load_data() -> dict:
+# ---------------------------------------------------------------------------
+# Storage: SQLite (WAL) with a JSON-file import for existing installs
+# ---------------------------------------------------------------------------
+# load_data()/save_data() keep their original dict interface, so nothing above
+# this layer knows the store changed. SQLite gives real transactions, so a
+# crash mid-write can no longer truncate or corrupt the file the old store
+# rewrote wholesale on every request.
+
+SCHEMA_VERSION = 1
+
+_SQL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS provider_keys (id TEXT PRIMARY KEY, ord INTEGER NOT NULL, doc TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS router_keys   (id TEXT PRIMARY KEY, ord INTEGER NOT NULL, doc TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS models        (name TEXT PRIMARY KEY, ord INTEGER NOT NULL, doc TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS combos        (name TEXT PRIMARY KEY, ord INTEGER NOT NULL, doc TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS proxy_pools   (id TEXT PRIMARY KEY, ord INTEGER NOT NULL, doc TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS logs          (seq INTEGER PRIMARY KEY, doc TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS kv            (k TEXT PRIMARY KEY, doc TEXT NOT NULL);
+"""
+
+_LIST_TABLES = {
+    "provider_keys": "id",
+    "router_keys": "id",
+    "models": "name",
+    "combos": "name",
+    "proxy_pools": "id",
+}
+_KV_KEYS = ("settings", "stats", "provider_index", "proxy_index", "provider_settings")
+_db_local = threading.local()
+_db_lock = threading.Lock()
+
+
+def db_path() -> Path:
+    override = os.environ.get("SAMET_ROUTER_DB", "").strip()
+    if override:
+        return Path(override)
+    # derive from DATA_FILE so tests (and SAMET_ROUTER_DATA) keep isolating
+    base = Path(str(DATA_FILE))
+    return base.with_suffix(".db")
+
+
+def _connect(path: Path) -> "sqlite3.Connection":
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=15, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(_SQL_SCHEMA)
+    conn.commit()
+    return conn
+
+
+def db() -> "sqlite3.Connection":
+    """Per-thread connection, keyed by path so reassigning DATA_FILE reopens."""
+    path = db_path()
+    conns = getattr(_db_local, "conns", None)
+    if conns is None:
+        conns = _db_local.conns = {}
+    with _db_lock:
+        conn = conns.get(path)
+        if conn is None:
+            if len(conns) >= 4:  # bound memory across many test temp paths
+                for c in conns.values():
+                    try:
+                        c.close()
+                    except sqlite3.Error:
+                        pass
+                conns.clear()
+            conn = conns[path] = _connect(path)
+        return conn
+
+
+def _row_id(doc: dict, key: str, fallback: str) -> str:
+    return str(doc.get(key) or fallback)
+
+
+def _write_store(data: dict) -> None:
+    """Persist the whole dict in a single transaction (upsert by id)."""
+    conn = db()
+    with conn:  # one transaction; rolls back as a unit on any error
+        for table, key in _LIST_TABLES.items():
+            rows = data.get(table) or []
+            conn.execute(f"DELETE FROM {table}")
+            conn.executemany(
+                f"INSERT OR REPLACE INTO {table} ({key}, ord, doc) VALUES (?,?,?)",
+                [(_row_id(r, key, f"{table}-{i}"), i, json.dumps(r, ensure_ascii=False))
+                 for i, r in enumerate(rows) if isinstance(r, dict)])
+        logs = data.get("logs") or []
+        conn.execute("DELETE FROM logs")
+        conn.executemany(
+            "INSERT INTO logs (seq, doc) VALUES (?,?)",
+            [(i, json.dumps(r, ensure_ascii=False))
+             for i, r in enumerate(logs) if isinstance(r, dict)])
+        conn.execute("DELETE FROM kv")
+        conn.executemany(
+            "INSERT INTO kv (k, doc) VALUES (?,?)",
+            [(k, json.dumps(data.get(k), ensure_ascii=False)) for k in _KV_KEYS])
+        conn.execute("INSERT OR REPLACE INTO meta (k, v) VALUES ('schema_version', ?)",
+                     (str(SCHEMA_VERSION),))
+
+
+def _read_store() -> dict | None:
+    conn = db()
+    try:
+        row = conn.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None  # empty store: caller decides seed vs import
+    data = default_data()
+    for table, key in _LIST_TABLES.items():
+        out = []
+        for (doc,) in conn.execute(f"SELECT doc FROM {table} ORDER BY ord"):
+            try:
+                out.append(json.loads(doc))
+            except (ValueError, TypeError):
+                continue
+        data[table] = out
+    data["logs"] = [json.loads(doc) for (doc,) in
+                    conn.execute("SELECT doc FROM logs ORDER BY seq")
+                    if _safe_json(doc) is not None]
+    for k in _KV_KEYS:
+        for (doc,) in conn.execute("SELECT doc FROM kv WHERE k=?", (k,)):
+            try:
+                data[k] = json.loads(doc)
+            except (ValueError, TypeError):
+                pass
+    return data
+
+
+def _safe_json(text: str):
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return None
+
+
+def _import_json_file(data: dict) -> bool:
+    """One-time import of an existing data.json into the seed dict."""
     if not DATA_FILE.exists():
-        data = default_data()
-        save_data(data)
-        return data
+        return False
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            legacy = json.load(f)
     except (json.JSONDecodeError, OSError):
+        return False
+    if not isinstance(legacy, dict) or not legacy:
+        return False
+    data.update(legacy)
+    try:  # keep the original as a backup next to the db
+        DATA_FILE.replace(DATA_FILE.with_suffix(".json.bak"))
+    except OSError:
+        pass
+    return True
+
+
+def load_data() -> dict:
+    stored = _read_store()
+    if stored is not None:
+        return _normalize_data(stored)
+    seed = default_data()
+    if _import_json_file(seed):
+        # normalize before persisting: the legacy migration renames keys that
+        # the sqlite schema has no table for, so it must happen while we still
+        # have the raw dict in hand.
+        seed = _normalize_data(seed)
+    _write_store(seed)
+    return seed
+
+
+def save_data(data: dict) -> None:
+    _write_store(data)
+
+
+def _normalize_data(data: dict) -> dict:
+    if not isinstance(data, dict):
         data = default_data()
-    base = default_data()
-    for k, v in base.items():
+    for k, v in default_data().items():
         data.setdefault(k, v)
     # also migrate the settings content
     if not isinstance(data.get("settings"), dict):
@@ -203,14 +371,6 @@ def load_data() -> dict:
     for sk in ("total_requests", "ok", "err", "input_tokens", "output_tokens"):
         data["stats"].setdefault(sk, 0)
     return data
-
-
-def save_data(data: dict) -> None:
-    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = DATA_FILE.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DATA_FILE)
 
 
 def provider_catalog() -> list[dict]:
@@ -2252,8 +2412,63 @@ _OC_SESSION_TTL = 3600.0
 
 def opencode_is_free_model(model: str) -> bool:
     """True for the keyless free-tier lane (v2 /inference/v1 + fingerprint)."""
-    base = str(model or "").split("(")[0].strip().lower()
+    base = opencode_base_model(model)
     return base.endswith("-free") or ":free" in base
+
+
+def opencode_base_model(model: str) -> str:
+    """Strip the 'model(level)' thinking suffix 9router uses for catalog lookup."""
+    return str(model or "").split("(")[0].strip().lower()
+
+
+# Upstream publishes no endpoint metadata (/models returns only id/object/created/
+# owned_by), so this was measured by replaying the v2 fingerprint against the
+# live endpoint. It is a hint, not a contract: call_upstream also retries the
+# other chat endpoints when upstream answers ModelProtocolUnsupported, so a
+# model moving between them self-heals without a code change.
+OPENCODE_SYSTEMONE_PREFIXES = ("jev",)
+OPENCODE_RESPONSES_HINTS = ("muse-spark",)
+
+
+def opencode_model_endpoint(model: str) -> str:
+    """Which /inference/v1 route a model answers on: chat | responses | systemone."""
+    base = opencode_base_model(model)
+    if base.startswith(OPENCODE_SYSTEMONE_PREFIXES):
+        # System One decision models take {state, questions} and return
+        # probabilities, not chat messages. Not proxyable through /v1/chat.
+        return "systemone"
+    if any(h in base for h in OPENCODE_RESPONSES_HINTS):
+        return "responses"
+    return "chat"
+
+
+def opencode_endpoint_candidates(model: str) -> list[str]:
+    """Routes to try, the hinted one first, without duplicates."""
+    first = opencode_model_endpoint(model)
+    if first == "systemone":
+        return ["systemone"]
+    rest = [e for e in ("chat", "responses", "messages") if e != first]
+    return [first] + rest
+
+
+def opencode_route_path(endpoint: str) -> str:
+    return {"chat": "chat/completions", "responses": "responses",
+            "messages": "messages", "systemone": "systemone"}[endpoint]
+
+
+def is_model_protocol_unsupported(resp) -> bool:
+    """True for upstream's "wrong endpoint" signal (measured: 400 + this type)."""
+    if getattr(resp, "status_code", 0) != 400:
+        return False
+    try:
+        body = resp.json()
+    except (ValueError, TypeError):
+        return False
+    err = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(err, dict):
+        return False
+    blob = json.dumps(err).lower()
+    return "modelprotocolunsupported" in blob or "does not support this protocol" in blob
 
 
 def _opencode_session_id() -> str:
@@ -2638,6 +2853,49 @@ def opencode_device_poll(device_code: str, server: str = OPENCODE_CONSOLE):
         timeout=30)
 
 
+def opencode_fetch_catalog(proxy: dict | None = None) -> list[dict]:
+    """Fetch the live model catalog from OpenCode and annotate each entry.
+
+    Upstream returns only id/object/created/owned_by, so the fields the UI
+    needs (lane, endpoint, chat-compatibility) are derived here rather than
+    trusted from the response.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    bases = [(OPENCODE_INFERENCE_BASE, True), (OPENCODE_BASE, False)]
+    for base, free_lane in bases:
+        try:
+            resp = requests.get(f"{base}/models", headers={"Authorization": "Bearer public"},
+                                timeout=20, proxies=proxy)
+        except requests.RequestException:
+            continue
+        if resp.status_code != 200:
+            continue
+        try:
+            payload = resp.json()
+        except (ValueError, TypeError):
+            continue
+        rows = payload.get("data") if isinstance(payload, dict) else payload
+        for row in (rows or []):
+            mid = str((row or {}).get("id") or "").strip()
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            endpoint = opencode_model_endpoint(mid)
+            out.append({
+                "id": mid,
+                "free": opencode_is_free_model(mid),
+                "endpoint": endpoint,
+                "lane": "free" if opencode_is_free_model(mid) else "paid",
+                "chat_compatible": endpoint != "systemone",
+                "owned_by": (row or {}).get("owned_by") or "",
+            })
+        if out:  # one good catalog is enough
+            break
+    out.sort(key=lambda m: (not m["free"], m["id"]))
+    return out
+
+
 def opencode_console_get(path: str, token: str, server: str = OPENCODE_CONSOLE):
     """Authenticated GET against the OpenCode Console API."""
     return requests.get(
@@ -2728,6 +2986,28 @@ def _close_quietly(resp) -> None:
         pass
 
 
+class _RefusalResponse:
+    """Synthetic non-200 response for a request we decline to send upstream.
+
+    Lets call_upstream refuse centrally instead of every handler duplicating the
+    check, so all three client dialects get the same clear message.
+    """
+
+    def __init__(self, status: int, payload: dict):
+        self.status_code = status
+        self._payload = payload
+        self.text = json.dumps(payload, ensure_ascii=False)
+
+    def json(self):
+        return self._payload
+
+    def iter_lines(self, decode_unicode=False):
+        return iter(())
+
+    def iter_content(self, chunk_size=None):
+        return iter(())
+
+
 def call_upstream(protocol: str, body: dict, gemini_model: str = "",
                   stream: bool = False, timeout=60,
                   extra_headers: dict | None = None, provider: str = "",
@@ -2769,28 +3049,54 @@ def call_upstream(protocol: str, body: dict, gemini_model: str = "",
 
         # OpenCode v2: keyless free tier lives on /inference/v1 behind the v2
         # fingerprint. Paid/keyed Zen stays on /zen/v1 untouched.
+        oc_endpoint = ""
         if entry_provider == "opencode" and opencode_is_free_model(body.get("model")):
+            oc_endpoint = opencode_model_endpoint(body.get("model"))
+            if oc_endpoint == "systemone":
+                # A System One decision model takes {state, questions} and returns
+                # probabilities. Sending it a chat body would only produce an
+                # opaque upstream 400, so refuse with something actionable.
+                return entry, _RefusalResponse(400, {"error": {
+                    "message": ("'%s' is a System One decision model. It is served on "
+                                "/inference/v1/systemone and takes {state, questions}, so it "
+                                "cannot be proxied through /v1/chat/completions."
+                                % body.get("model")),
+                    "type": "invalid_request_error", "code": "systemone_model"}})
             base = OPENCODE_INFERENCE_BASE
             ses = opencode_session(entry)
             merged_extra = {**opencode_v2_headers(ses),
                             **{k: v for k, v in merged_extra.items() if v}}
             # upstream insists on stream:true; the handler aggregates if needed
             rename = apply_opencode_v2_tools(body)
+            oc_endpoint = opencode_model_endpoint(body.get("model"))
             if oc_state is not None:
-                oc_state.update({"rename": rename, "session": ses, "forced_stream": True})
+                oc_state.update({"rename": rename, "session": ses, "forced_stream": True,
+                                 "endpoint": oc_endpoint})
             merged_extra.setdefault("Accept", "text/event-stream")
+
+        def _post(url: str):
+            return requests.post(
+                url, headers=upstream_headers(protocol, key, merged_extra),
+                json=body, timeout=timeout, stream=stream, proxies=proxy)
 
         try:
             if protocol == "openai":
-                resp = requests.post(
-                    openai_chat_url(base),
-                    headers=upstream_headers(protocol, key, merged_extra),
-                    json=body, timeout=timeout, stream=stream, proxies=proxy)
+                if oc_endpoint and oc_endpoint != "chat":
+                    resp = _post(f"{base}/{opencode_route_path(oc_endpoint)}")
+                    # upstream publishes no endpoint map, so on its explicit
+                    # "wrong endpoint" signal walk the remaining chat routes.
+                    for alt in opencode_endpoint_candidates(body.get("model")):
+                        if alt == oc_endpoint or alt == "systemone" or resp.status_code != 400:
+                            continue
+                        if not is_model_protocol_unsupported(resp):
+                            break
+                        _close_quietly(resp)
+                        oc_endpoint = alt
+                        resp = _post(f"{base}/{opencode_route_path(alt)}")
+                else:
+                    resp = _post(openai_chat_url(base))
             elif protocol == "anthropic":
-                resp = requests.post(
-                    anthropic_messages_url(base),
-                    headers=upstream_headers(protocol, key, merged_extra),
-                    json=body, timeout=timeout, stream=stream, proxies=proxy)
+                resp = _post(anthropic_messages_url(base))
             else:
                 url = gemini_generate_url(base, gemini_model) + f"?key={key}"
                 kwargs: dict = {"json": body, "timeout": timeout}
@@ -3585,6 +3891,36 @@ def create_app() -> Flask:
                                    if p.get("id") != pool_id]
             save_data(data)
         return jsonify({"ok": True})
+
+    @app.post("/admin/api/providers/<provider_id>/models/fetch")
+    def admin_fetch_provider_models(provider_id: str):
+        """Pull the live model catalog for a provider (OpenCode today)."""
+        if (err := need_admin_auth()) is not None:
+            return err
+        pid = (provider_id or "").strip().lower()
+        if pid not in PROVIDERS:
+            return jsonify({"error": f"unknown provider: {pid}"}), 400
+        if pid != "opencode":
+            return jsonify({"error": f"catalog fetch is not implemented for {pid}",
+                            "hint": "add models manually from the Models tab"}), 400
+        with _lock:
+            data = load_data()
+            proxy = _proxy_dict(_pick_proxy(data, pid))
+            save_data(data)
+        try:
+            models = opencode_fetch_catalog(proxy)
+        except Exception as exc:  # noqa: BLE001 - upstream can be anything
+            return jsonify({"error": f"catalog fetch failed: {exc}"[:300]}), 502
+        if not models:
+            return jsonify({"error": "upstream returned no models",
+                            "hint": "check connectivity or proxy settings"}), 502
+        have = {str(m.get("upstream_model") or "") for m in data.get("models", [])
+                if isinstance(m, dict) and (m.get("provider") or "") == pid}
+        for m in models:
+            m["added"] = m["id"] in have
+        return jsonify({"models": models,
+                        "free": sum(1 for m in models if m["free"]),
+                        "chat": sum(1 for m in models if m["chat_compatible"])})
 
     @app.post("/admin/api/providers/<provider_id>/models")
     def admin_provider_add_model(provider_id: str):

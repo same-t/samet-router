@@ -96,6 +96,7 @@
             <option value="off">Off</option>
           </select>
         </label>
+        <button type="button" class="ghost" onclick="openCatalog()">☰ Get Models</button>
         <button type="button" class="ghost" onclick="disableAllModels()">⊘ Disable All</button>
       </div>
       <div class="pd-models-grid" id="pd-models"></div>
@@ -162,6 +163,37 @@
     <div id="oc-status" class="check-msg hidden"></div>
     <div class="modal-actions">
       <button class="btn-cancel" onclick="closeOpencode()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="cat-modal" class="modal-backdrop hidden">
+  <div class="modal wide">
+    <div class="modal-head">
+      <span class="dots"><i class="dot red"></i><i class="dot yellow"></i><i class="dot green"></i></span>
+      <span>Get Models — live catalog</span>
+    </div>
+    <div class="modal-body">
+      <div class="picker-note">Free models route to <code>/inference/v1</code> with the v2
+        fingerprint. Paid models need a key on <code>/zen/v1</code>. Models tagged
+        <span class="tag">systemone</span> take <code>{{state, questions}}</code> and are not
+        reachable through <code>/v1/chat/completions</code>.</div>
+      <div class="picker-search">
+        <span class="mag">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <circle cx="11" cy="11" r="7" /><path d="M20 20l-3.5-3.5" stroke-linecap="round"/>
+          </svg>
+        </span>
+        <input id="cat-q" placeholder="Search the catalog…" autocomplete="off" />
+      </div>
+      <div class="picker-meta">
+        <span id="cat-meta">…</span>
+        <button id="cat-addfree" onclick="addAllFree()">＋ Add all free</button>
+      </div>
+      <div id="cat-body" style="max-height:48vh;overflow-y:auto"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeCatalog()">Close</button>
     </div>
   </div>
 </div>
@@ -386,6 +418,79 @@ async function addSuggested(up) {
   });
   if (r.ok) load();
 }
+
+/* --- Get Models (live upstream catalog) --- */
+let CATALOG = [];
+function openCatalog() {
+  $('cat-modal').classList.remove('hidden');
+  $('cat-body').innerHTML = '<p class="hint">fetching catalog…</p>';
+  $('cat-meta').textContent = '';
+  $('cat-addfree').disabled = true;
+  fetchCatalog();
+}
+function closeCatalog() { $('cat-modal').classList.add('hidden'); }
+
+async function fetchCatalog() {
+  const r = await fetch('/admin/api/providers/' + encodeURIComponent(PID) + '/models/fetch', { method: 'POST' });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    $('cat-body').innerHTML = `<p class="hint" style="color:var(--err)">${esc(j.error || 'fetch failed')}</p>`;
+    return;
+  }
+  CATALOG = j.models || [];
+  $('cat-q').value = '';
+  renderCatalog();
+  $('cat-addfree').disabled = !CATALOG.some(m => m.free && !m.added && m.chat_compatible);
+}
+
+function renderCatalog() {
+  const q = $('cat-q').value.trim().toLowerCase();
+  const rows = CATALOG.filter(m => !q || m.id.toLowerCase().includes(q));
+  const free = rows.filter(m => m.free).length;
+  const chat = rows.filter(m => m.chat_compatible).length;
+  $('cat-meta').textContent =
+    `${rows.length} shown · ${free} free · ${chat} chat-compatible`;
+  if (!rows.length) {
+    $('cat-body').innerHTML = '<p class="hint">No models match.</p>';
+    return;
+  }
+  const badge = m => {
+    const bits = [];
+    if (m.free) bits.push('<span class="tag ok">free</span>');
+    else bits.push('<span class="tag">paid</span>');
+    if (!m.chat_compatible) bits.push('<span class="tag">systemone</span>');
+    else if (m.endpoint !== 'chat') bits.push(`<span class="tag acc">/${m.endpoint}</span>`);
+    return bits.join(' ');
+  };
+  $('cat-body').innerHTML = rows.map(m => `
+    <div class="pick-group-label" style="border:0;margin:0;padding:6px 0 3px;display:block">
+      <span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <code style="font-family:var(--font-mono);font-size:12.5px">${esc(m.id)}</code>
+        ${badge(m)}
+        ${m.added ? '<span class="tag ok">added</span>'
+                  : `<button class="ghost" style="padding:2px 10px;font-size:11.5px;margin-left:auto"
+                     onclick="addCatalog('${esc(m.id)}')"${m.chat_compatible ? '' : ' disabled title="System One decision model: not usable via /v1/chat/completions"'}>Add</button>`}
+      </span>
+    </div>`).join('');
+}
+
+async function addCatalog(id) {
+  await addSuggested(id);
+  const m = CATALOG.find(x => x.id === id);
+  if (m) m.added = true;
+  renderCatalog();
+  load();
+}
+
+async function addAllFree() {
+  const todo = CATALOG.filter(m => m.free && !m.added && m.chat_compatible);
+  for (const m of todo) {
+    await addSuggested(m.id);
+    m.added = true;
+  }
+  renderCatalog();
+  load();
+}
 function copyText(t) {
   navigator.clipboard?.writeText(t).then(() => alert('copied')).catch(() => prompt('Copy:', t));
 }
@@ -467,6 +572,12 @@ async function saveConn() {
   closeAddConn();
   load();
 }
+
+$('cat-q').addEventListener('input', renderCatalog);
+document.querySelectorAll('.modal-backdrop').forEach(back => {
+  back.addEventListener('mousedown', e => { if (e.target === back) back.classList.add('hidden'); });
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeCatalog(); });
 
 load();
 </script>

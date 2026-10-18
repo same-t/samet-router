@@ -58,6 +58,7 @@ python app.py
 | `GET /admin/api/combos` | combos + the list of models a combo can point at |
 | `POST /admin/api/combos` | create/update a combo (`{name, model, description?}`); same name updates in place |
 | `DELETE /admin/api/combos/<name>` | delete a combo |
+| `POST /admin/api/providers/<id>/models/fetch` | live upstream model catalog with lane/endpoint annotations (opencode) |
 | `DELETE /admin/api/provider-keys/<id>` | delete upstream key |
 | `GET /admin/api/stats` | dashboard summary: total/ok/err, success %, input/output/total tokens, avg. latency, thinking count, model/key/endpoint/provider/daily breakdown |
 | `DELETE /admin/api/stats` | reset statistics + logs |
@@ -133,7 +134,8 @@ Invoke-RestMethod -Method Post `
 | Variable | Description |
 |---|---|
 | `PORT` | default `20003` |
-| `SAMET_ROUTER_DATA` | JSON data file path (default `./data.json`) |
+| `SAMET_ROUTER_DB` | SQLite file path (default: `data.db` beside `SAMET_ROUTER_DATA`) |
+| `SAMET_ROUTER_DATA` | data directory (`data.json` is imported once, then `data.db` lives beside it) |
 | `ROUTER_API_KEY` | optional single server key. If set **or** a user key exists in the panel, auth is required: `Authorization: Bearer ...` **or** `x-api-key: ...` (Claude Code sends `x-api-key`). If neither exists, it is open in local mode |
 | `ADMIN_TOKEN` | if set, `/admin/api/*` requires Bearer |
 
@@ -160,4 +162,16 @@ Tests do not send real requests to Gemini (`requests.post` is mocked).
 - **OpenCode has two lanes.** Models ending in `-free` (or containing `:free`) use the keyless v2 free tier: `/inference/v1` + the v2 client fingerprint (`opencode/latest/<ver>/cli`, `x-opencode-session`/`-session-id`, verbatim `read`+`shell` tool schemas). Everything else stays on `/zen/v1` with the connection key. The free lane forces `stream:true` upstream, so non-streaming clients are served by aggregating the SSE response. A caller tool named `read`/`shell` is sent as `read_client`/`shell_client` to make room for the fingerprint pair, then renamed back in the response.
 - Model mappings pin to their own provider's keys. Keys are no longer pooled across providers that merely share a protocol (`opencode` and `commandcode` both speak `openai`).
 - **Combos** (`/admin` → Combos) give an existing model a second name. A combo points at exactly one model and shows up in `GET /v1/models` like any other id; `resolve_target` resolves the combo first, so it inherits the target's provider, settings and thinking config. Names are limited to letters, numbers, `.`, `_`, `-` (max 64) and may not collide with a model name or another combo.
+- **Storage is SQLite** (`data.db`, WAL), not a JSON file. `load_data()`/`save_data()` keep their
+  dict interface, so nothing above the storage layer changed. An existing `data.json` is imported
+  once and left behind as `data.json.bak`. Set `SAMET_ROUTER_DB` to point at a different file;
+  `SAMET_ROUTER_DATA` still decides which directory they live in. Writes are a single transaction,
+  so an interrupted save can no longer truncate the store.
+- **Get Models** on the OpenCode provider page pulls the live catalog (`/models`, 85 entries) and
+  annotates each one with its lane, endpoint and chat-compatibility. Click to add, or bulk-add the
+  free ones. Upstream publishes no endpoint metadata — `/models` returns only
+  `id/object/created/owned_by` — so the routing hint is derived, and `call_upstream` additionally
+  walks `chat → responses → messages` whenever upstream answers `ModelProtocolUnsupported`.
+  System One models (`jev-*`) take `{state, questions}` and are refused on `/v1/chat/completions`
+  with an explicit error rather than an opaque upstream 400.
 - This is a hobby/startup prototype; add auth + rate limiting + DB for production.

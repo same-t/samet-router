@@ -3,5 +3,12 @@ __pycache__/
 .venv/
 venv/
 data.json
+data.json.bak
+data.db
+data.db-wal
+data.db-shm
+*.db
+*.db-wal
+*.db-shm
 *.tmp
 .pytest_cache/
