@@ -249,7 +249,7 @@ async function load() {
   $('pd-headers-badge').classList.toggle('hidden',
     !(d.settings.headers_active && (d.settings.custom_headers || []).length));
 
-  renderConnections(d.connections || [], d.cooling || []);
+  renderConnections(d.connections || [], d.cooling || [], d.usage || []);
   renderModels(d.models || [], d.short, d.id);
   renderSuggestions(d.suggestions || []);
   document.querySelector('.pd-suggest-title').textContent = pdSuggestTitle(d.id);
@@ -261,8 +261,9 @@ async function load() {
   } catch (e) {}
 }
 
-function renderConnections(conns, cooling) {
+function renderConnections(conns, cooling, usage) {
   const cool = new Map((cooling || []).map(c => [c.id, c.retry_after]));
+  const use = new Map((usage || []).map(u => [u.id, u]));
   if (!conns.length) {
     $('conn-left').innerHTML = `<div class="conn-empty"><span class="conn-lock">${PD_LOCK}</span> No connections yet</div>`;
     return;
@@ -275,11 +276,19 @@ function renderConnections(conns, cooling) {
     const mins = left ? Math.ceil(left / 60) : 0;
     const badge = left
       ? `<span class="tag" title="rate limited: skipped until the cooldown ends"
-             style="background:var(--warn-a,rgba(245,165,36,.14));border-color:rgba(245,165,36,.4);color:#f5a524"
+             style="background:rgba(245,165,36,.14);border-color:rgba(245,165,36,.4);color:#f5a524"
              >cooling ~${mins}m</span>`
       : '';
+    const u = use.get(k.id) || {};
+    const since = u.requests_since_reset ?? 0;
+    const total = u.requests_total ?? 0;
+    const meta = [];
+    meta.push(`<span title="requests sent since this key last hit a rate limit">since reset <b>${since}</b></span>`);
+    if (total && total !== since) meta.push(`<span>total ${total}</span>`);
+    if (u.upstream_model) meta.push(`<span title="model upstream actually served">served ${esc(u.upstream_model)}</span>`);
+    if (u.upstream_log_id) meta.push(`<span title="upstream trace id (quote to support)">log ${esc(u.upstream_log_id.slice(0, 8))}</span>`);
     return `
-    <div class="conn-item">
+    <div class="conn-item" style="flex-wrap:wrap">
       <span class="conn-dot"${left ? ' style="background:#f5a524"' : ''}></span>
       <span class="conn-label">${esc(k.label)}</span>
       ${isOauth
@@ -288,6 +297,7 @@ function renderConnections(conns, cooling) {
       ${badge}
       ${sub ? `<span class="conn-meta">${esc(sub)}</span>` : ''}
       <span class="conn-meta">prio ${k.priority ?? 1}</span>
+      <span class="conn-meta" style="width:100%;display:flex;gap:12px;flex-wrap:wrap;margin-top:2px">${meta.join('')}</span>
       <button class="conn-del" onclick="delConnection('${k.id}')">Delete</button>
     </div>`;
   }).join('');
@@ -296,6 +306,9 @@ function renderConnections(conns, cooling) {
       rate limited and being skipped. When every key is cooling, the router replays
       the last good response for this provider instead of failing.</p>`;
   }
+  $('conn-left').innerHTML += `<p class="hint" style="margin-top:6px">OpenCode sends no
+    quota or balance headers, so these counters are the local proxy: <code>since reset</code>
+    counts requests since this key last answered 429.</p>`;
 }
 async function delConnection(id) {
   await fetch('/admin/api/provider-keys/' + id, { method: 'DELETE' });

@@ -500,6 +500,98 @@ def cache_get_response(provider: str, model: str) -> dict | None:
     return hit
 
 
+# ---------------------------------------------------------------------------
+# Per-key request accounting
+# ---------------------------------------------------------------------------
+# Measured 2026-10-18: a successful 200 carries no rate-limit headers at all
+# (only cloudflare plumbing plus x-opencode-log-id and x-zen-model), and the
+# console exposes no usage/balance/limits endpoint - /api/user is the only
+# authenticated route and returns just id/email/role. Upstream published a
+# feature request for exactly this (anomalyco/opencode#55816). So remaining
+# quota cannot be read from the wire; these counters are the local proxy for it.
+
+_key_usage: dict[str, dict] = {}
+USAGE_KEYS = ("requests_since_reset", "requests_total", "last_429_at",
+              "last_429_retry_after", "last_ok_at", "upstream_log_id",
+              "upstream_model", "last_status")
+
+
+def _usage_slot(entry: dict) -> dict:
+    ident = _cooldown_key(entry)
+    slot = _key_usage.get(ident)
+    if slot is None:
+        slot = _key_usage[ident] = {
+            "requests_since_reset": 0, "requests_total": 0,
+            "last_429_at": 0, "last_429_retry_after": 0.0,
+            "last_ok_at": 0, "upstream_log_id": "", "upstream_model": "",
+            "last_status": 0,
+        }
+    return slot
+
+
+def note_request_sent(entry: dict) -> None:
+    slot = _usage_slot(entry)
+    slot["requests_since_reset"] += 1
+    slot["requests_total"] += 1
+
+
+def note_rate_limited(entry: dict, retry_after: float) -> None:
+    slot = _usage_slot(entry)
+    slot["last_429_at"] = time.time()
+    slot["last_429_retry_after"] = retry_after
+    slot["last_status"] = 429
+    slot["requests_since_reset"] = 0  # quota window just rolled over
+
+
+def note_upstream_result(entry: dict, resp) -> None:
+    """Record what upstream said, including the two headers it does send."""
+    slot = _usage_slot(entry)
+    status = int(getattr(resp, "status_code", 0) or 0)
+    slot["last_status"] = status
+    headers = getattr(resp, "headers", None)
+    if headers:
+        try:
+            lower = {str(k).lower(): v for k, v in headers.items()}
+        except (AttributeError, TypeError):
+            lower = {}
+        # trace id is what opencode support asks for
+        if lower.get("x-opencode-log-id"):
+            slot["upstream_log_id"] = str(lower["x-opencode-log-id"])
+        # echoes the model upstream actually served, so a silent substitution shows up
+        if lower.get("x-zen-model"):
+            slot["upstream_model"] = str(lower["x-zen-model"])
+    if status == 200:
+        slot["last_ok_at"] = time.time()
+
+
+def key_usage_report(provider: str) -> list[dict]:
+    """Per-key accounting for the admin UI."""
+    with _lock:
+        data = load_data()
+    now = time.time()
+    out = []
+    for entry in data.get("provider_keys", []):
+        if not isinstance(entry, dict) or (entry.get("provider") or "") != provider:
+            continue
+        ident = _cooldown_key(entry)
+        slot = _key_usage.get(ident)
+        row = {
+            "id": entry.get("id"), "label": entry.get("label"),
+            "requests_since_reset": (slot or {}).get("requests_since_reset", 0),
+            "requests_total": (slot or {}).get("requests_total", 0),
+            "last_status": (slot or {}).get("last_status", 0),
+            "upstream_log_id": (slot or {}).get("upstream_log_id", ""),
+            "upstream_model": (slot or {}).get("upstream_model", ""),
+            "last_429_at": (slot or {}).get("last_429_at", 0),
+            "last_429_in": (max(0.0, now - (slot or {}).get("last_429_at", 0))
+                            if (slot or {}).get("last_429_at") else 0),
+            "last_ok_in": (max(0.0, now - (slot or {}).get("last_ok_at", 0))
+                           if (slot or {}).get("last_ok_at") else 0),
+        }
+        out.append(row)
+    return out
+
+
 def served_from_cache(provider_id: str, upstream_model: str, router_model: str,
                       cooling: AllKeysCoolingDown, anthropic: bool = False):
     """Serve the last good response while every key is rate-limited.
@@ -3254,6 +3346,7 @@ def call_upstream(protocol: str, body: dict, gemini_model: str = "",
 
         try:
             if protocol == "openai":
+                note_request_sent(entry)
                 if oc_endpoint and oc_endpoint != "chat":
                     resp = _post(f"{base}/{opencode_route_path(oc_endpoint)}")
                     # upstream publishes no endpoint map, so on its explicit
@@ -3269,6 +3362,7 @@ def call_upstream(protocol: str, body: dict, gemini_model: str = "",
                 else:
                     resp = _post(openai_chat_url(base))
             elif protocol == "anthropic":
+                note_request_sent(entry)
                 resp = _post(anthropic_messages_url(base))
             else:
                 url = gemini_generate_url(base, gemini_model) + f"?key={key}"
@@ -3277,10 +3371,12 @@ def call_upstream(protocol: str, body: dict, gemini_model: str = "",
                     kwargs["headers"] = upstream_headers("gemini", key, merged_extra)
                 if proxy:
                     kwargs["proxies"] = proxy
+                note_request_sent(entry)
                 resp = requests.post(url, **kwargs)
         except requests.RequestException as exc:
             last_exc = exc
             continue
+        note_upstream_result(entry, resp)
         if resp.status_code == 200:
             _advance_provider_index(protocol, len(pool), provider)
             return entry, resp
@@ -3289,6 +3385,7 @@ def call_upstream(protocol: str, body: dict, gemini_model: str = "",
             # explicit Retry-After when upstream sent one (OpenCode's daily free
             # quota resets at 00:00 UTC and reports ~19h, far past our 5 min).
             secs = mark_key_cooling(entry, retry_after_seconds(resp))
+            note_rate_limited(entry, secs)
             if i < len(pool) - 1:
                 _close_quietly(resp)
                 last_exc = RuntimeError(f"upstream 429: {resp.text[:300]}")
@@ -3812,6 +3909,7 @@ def create_app() -> Flask:
             "settings": get_provider_settings(data, pid),
             "connections": [_masked_provider_key(k) for k in keys],
             "cooling": cooling_key_report(pid),
+            "usage": key_usage_report(pid),
             "models": [{"name": m.get("name", ""),
                         "upstream_model": str(m.get("upstream_model") or m.get("gemini_model") or ""),
                         "description": m.get("description", ""),

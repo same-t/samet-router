@@ -185,4 +185,12 @@ Tests do not send real requests to Gemini (`requests.post` is mocked).
   is always flagged — `X-Samet-Router: stale-response` and a `samet_router` block in the body with
   the original timestamp, age and `retry_after`. With nothing cached the router returns an honest
   429 carrying `Retry-After`.
+- **Quota visibility is local, not upstream.** Measured 2026-10-18: a successful 200 carries no
+  rate-limit headers at all — the only upstream signals are `x-opencode-log-id` (trace id, quote it
+  to support) and `x-zen-model` (the model upstream actually served, so a silent substitution shows
+  up). The console exposes no usage/balance/limits route; `/api/user` is the only authenticated
+  endpoint and returns just `id`/`email`/`role`. Upstream has an open feature request for exactly
+  this (`anomalyco/opencode#55816`). So the router keeps its own per-key counters and shows them on
+  the provider page: `requests_since_reset` (since that key last answered 429 — the practical stand-in
+  for remaining quota), `requests_total`, last status, and the two captured upstream headers.
 - This is a hobby/startup prototype; add auth + rate limiting + DB for production.

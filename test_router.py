@@ -1702,6 +1702,97 @@ def test_first_429_with_single_key_falls_to_cache(tmp_path, monkeypatch):
     assert r.headers["X-Samet-Router"] == "stale-response"
 
 
+# ---------------------------------------------------------------------------
+# Per-key request accounting
+# ---------------------------------------------------------------------------
+
+
+def test_key_usage_counts_and_resets_on_429(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    _reset_circuit()
+    router._key_usage.clear()
+    c.post("/admin/api/provider-keys", json={"key": "sk-a", "label": "a",
+                                            "provider": "openai"})
+    c.post("/admin/api/models", json={"name": "m", "provider": "openai",
+                                     "upstream_model": "gpt-x"})
+
+    class R200:
+        status_code = 200
+        text = "ok"
+        headers = {"x-opencode-log-id": "abc12345-def",
+                   "x-zen-model": "gpt-x-real"}
+
+        def json(self):
+            return fake_openai_chat("ok")
+
+    class R429:
+        status_code = 429
+        text = "slow"
+        headers = {"retry-after": "600"}
+
+        def json(self):
+            return {"error": {"message": "Rate limit exceeded"}}
+
+    monkeypatch.setattr(router.requests, "post", lambda url, **kw: R200())
+    for _ in range(3):
+        assert c.post("/v1/chat/completions", json={
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]}).status_code == 200
+
+    usage = c.get("/admin/api/providers/openai").get_json()["usage"]
+    row = usage[0]
+    assert row["requests_since_reset"] == 3
+    assert row["requests_total"] == 3
+    assert row["last_status"] == 200
+    # the two headers upstream does send are captured
+    assert row["upstream_log_id"] == "abc12345-def"
+    assert row["upstream_model"] == "gpt-x-real"
+    assert row["last_ok_in"] < 5
+
+    # a 429 rolls the quota window over
+    monkeypatch.setattr(router.requests, "post", lambda url, **kw: R429())
+    c.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    row = c.get("/admin/api/providers/openai").get_json()["usage"][0]
+    assert row["requests_since_reset"] == 0
+    # total keeps climbing: the 429 request itself was still sent upstream
+    assert row["requests_total"] == 4
+    assert row["last_status"] == 429
+    assert 0 < row["last_429_in"] < 5
+
+
+def test_key_usage_survives_missing_headers(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    _reset_circuit()
+    router._key_usage.clear()
+    c.post("/admin/api/provider-keys", json={"key": "sk-a", "provider": "openai"})
+    c.post("/admin/api/models", json={"name": "m", "provider": "openai",
+                                     "upstream_model": "gpt-x"})
+
+    class Bare:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return fake_openai_chat("ok")
+
+    monkeypatch.setattr(router.requests, "post", lambda url, **kw: Bare())
+    assert c.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}]}).status_code == 200
+    row = c.get("/admin/api/providers/openai").get_json()["usage"][0]
+    assert row["requests_total"] == 1
+    assert row["upstream_log_id"] == ""
+    assert row["upstream_model"] == ""
+
+
+def test_key_usage_zeroed_for_fresh_keys(tmp_path):
+    c = make_client(tmp_path)
+    c.post("/admin/api/provider-keys", json={"key": "sk-new", "provider": "openai"})
+    row = c.get("/admin/api/providers/openai").get_json()["usage"][0]
+    assert row["requests_since_reset"] == 0
+    assert row["requests_total"] == 0
+    assert row["last_429_in"] == 0
+
+
 def test_retry_after_parsing(tmp_path):
     class R:
         def __init__(self, h):
