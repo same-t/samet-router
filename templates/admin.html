@@ -70,6 +70,127 @@
       <tbody id="rk-body"></tbody></table>
     </section>
 
+    <section id="tab-usage" class="tab hidden">
+      <div class="toolbar">
+        <div class="segmented" role="tablist" aria-label="Usage view">
+          <button role="tab" aria-selected="true" data-usetab="overview">Overview</button>
+          <button role="tab" aria-selected="false" data-usetab="details">Details</button>
+        </div>
+        <span class="toolbar__spacer"></span>
+        <div class="ranges" role="group" aria-label="Time range">
+          <button data-range="24h" aria-selected="false">Today</button>
+          <button data-range="7d" aria-selected="true">7D</button>
+          <button data-range="30d" aria-selected="false">30D</button>
+          <button data-range="60d" aria-selected="false">60D</button>
+          <button data-range="all" aria-selected="false">All</button>
+        </div>
+      </div>
+
+      <div class="statgrid" id="u-stats"></div>
+
+      <div class="usage-sub" id="use-overview">
+        <div class="grid2">
+          <div class="panel-card">
+            <div class="panel-card__head">
+              <span class="panel-card__title">Traffic flow</span>
+              <span class="hint" id="u-flow-note"></span>
+            </div>
+            <div class="flow" id="u-flow"></div>
+          </div>
+          <div class="panel-card">
+            <div class="panel-card__head">
+              <span class="panel-card__title">Recent requests</span>
+              <span class="hint" id="u-recent-note"></span>
+            </div>
+            <div class="recent-scroll">
+              <table class="usage"><thead><tr>
+                <th>Model</th><th style="text-align:right">In</th>
+                <th style="text-align:right">Out</th><th>When</th>
+              </tr></thead><tbody id="u-recent"></tbody></table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="usage-sub hidden" id="use-details">
+        <div class="panel-card" style="margin-bottom:18px">
+          <div class="panel-card__head">
+            <span class="panel-card__title">Over time</span>
+            <div class="segmented" role="tablist" aria-label="Chart metric">
+              <button role="tab" aria-selected="true" data-metric="tokens">Tokens</button>
+              <button role="tab" aria-selected="false" data-metric="requests">Requests</button>
+              <button role="tab" aria-selected="false" data-metric="cost">Cost</button>
+            </div>
+          </div>
+          <div id="u-chart"></div>
+        </div>
+
+        <div class="grid2" style="margin-bottom:18px">
+          <div class="panel-card">
+            <div class="panel-card__head"><span class="panel-card__title">By provider</span></div>
+            <div class="bars" id="u-by-provider"></div>
+          </div>
+          <div class="panel-card">
+            <div class="panel-card__head"><span class="panel-card__title">Top models</span></div>
+            <div class="bars" id="u-by-model"></div>
+          </div>
+        </div>
+
+        <div class="panel-card">
+          <div class="panel-card__head">
+            <span class="panel-card__title">Usage by model</span>
+            <span class="hint" id="u-model-note"></span>
+          </div>
+          <table class="usage"><thead><tr>
+            <th>Model</th><th>Provider</th>
+            <th style="text-align:right">Requests</th><th>Last used</th>
+            <th style="text-align:right">Input</th><th style="text-align:right">Output</th>
+            <th style="text-align:right">Avg latency</th><th style="text-align:right">Cost</th>
+          </tr></thead><tbody id="u-models"></tbody></table>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-endpoint" class="tab hidden">
+      <div class="panel-card" style="margin-bottom:18px">
+        <div class="panel-card__head"><span class="panel-card__title">API Endpoint</span></div>
+        <div class="endpoint-row">
+          <span class="endpoint-row__tag">Local</span>
+          <div class="endpoint-url">
+            <code id="ep-url">—</code>
+            <button type="button" onclick="copyEndpoint()">Copy</button>
+          </div>
+          <span class="endpoint-row__spacer"></span>
+        </div>
+        <p class="hint">Point any OpenAI, Anthropic or Gemini client at this base URL.
+          Keys go in an <code>Authorization: Bearer</code> or <code>x-api-key</code> header.</p>
+      </div>
+
+      <div class="panel-card">
+        <div class="panel-card__head">
+          <span class="panel-card__title">API Keys</span>
+          <div class="row" style="margin:0">
+            <input id="ep-label" placeholder="label (e.g. laptop)" />
+            <button class="btn-save" onclick="epCreateKey()">Create key</button>
+          </div>
+        </div>
+
+        <div class="endpoint-row" style="border-top:1px solid var(--line-soft); padding-top:16px">
+          <label class="toggle">
+            <input type="checkbox" id="ep-require" onchange="epSetRequire(this.checked)" />
+            <span class="toggle__track"></span>
+            <span>
+              <span style="display:block;font-weight:650;font-size:13px">Require API key</span>
+              <span class="hint">Requests without a valid key are rejected</span>
+            </span>
+          </label>
+        </div>
+
+        <div id="ep-notice"></div>
+        <div class="keylist" id="ep-keys"></div>
+      </div>
+    </section>
+
     <section id="tab-providers" class="tab hidden">
       <div class="prov-head">
         <h3 class="prov-title">Free Tier Providers</h3>
@@ -711,6 +832,413 @@ async function resetStats(){
   await fetch('/admin/api/stats', {method:'DELETE'}); refresh();
 }
 function copyText(t){ navigator.clipboard?.writeText(t); }
+
+/* ==========================================================================
+   Usage & analytics
+
+   Everything below reads /admin/api/usage. There is no fallback number and no
+   client-side seed data: a range with no traffic renders as an empty state,
+   because a chart that draws itself out of a constant is worse than no chart.
+   ========================================================================== */
+const USAGE = {range: '7d', view: 'overview', metric: 'tokens', data: null};
+
+function compact(n){
+  n = Number(n || 0);
+  if (!n) return '0';
+  const a = Math.abs(n);
+  if (a >= 1e9) return (n/1e9).toFixed(a >= 1e10 ? 0 : 1).replace(/\.0$/,'') + 'B';
+  if (a >= 1e6) return (n/1e6).toFixed(a >= 1e7 ? 0 : 1).replace(/\.0$/,'') + 'M';
+  if (a >= 1e3) return (n/1e3).toFixed(a >= 1e4 ? 0 : 1).replace(/\.0$/,'') + 'K';
+  return String(Math.round(n));
+}
+function money(v){
+  if (v === null || v === undefined) return '—';
+  const n = Number(v);
+  if (!n) return '$0.00';
+  return '$' + (n < 0.01 ? n.toFixed(4) : n.toFixed(2));
+}
+function ago(ts){
+  const d = new Date(ts).getTime();
+  if (!d || isNaN(d)) return '—';
+  const s = Math.max(0, (Date.now() - d) / 1000);
+  if (s < 60) return Math.floor(s) + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  if (s < 86400) return Math.floor(s/3600) + 'h ago';
+  return Math.floor(s/86400) + 'd ago';
+}
+function setView(name, list){
+  (list || []).forEach(b => b.setAttribute('aria-selected', String(b.dataset[name] === USAGE[name])));
+}
+
+function statCard(val, lbl, cls, sub){
+  return `<div class="stat"><div class="stat__val ${cls||''}">${val}</div>` +
+         `<div class="stat__lbl">${esc(lbl)}</div>` +
+         (sub ? `<div class="stat__sub">${esc(sub)}</div>` : '') + '</div>';
+}
+
+function renderUsageStats(){
+  const d = USAGE.data;
+  if (!d) return;
+  const s = d.summary;
+  const cards = [
+    statCard(fmt(s.total_requests), 'Total requests', '',
+      s.total_requests ? `${fmt(s.ok)} ok · ${fmt(s.err)} failed` : 'no traffic in this range'),
+    statCard(compact(s.input_tokens), 'Input tokens', 'is-in'),
+    statCard(compact(s.output_tokens), 'Output tokens', 'is-out'),
+    statCard(s.total_requests ? s.success_rate + '%' : '—', 'Success rate',
+      s.err ? 'is-err' : ''),
+    statCard(s.avg_latency_ms ? fmt(s.avg_latency_ms) + ' ms' : '—', 'Avg latency'),
+  ];
+  if (d.pricing_configured) {
+    cards.push(statCard(money(s.cost), 'Est. cost', 'is-cost', 'from your price list'));
+  } else {
+    cards.push(statCard('—', 'Est. cost', 'is-muted', 'no pricing configured'));
+  }
+  $('u-stats').innerHTML = cards.join('');
+}
+
+/* --- traffic flow: router at the centre, one spoke per provider actually
+       used. Node weight is the request share, so the picture is a measurement. */
+function renderFlow(){
+  const d = USAGE.data;
+  const host = $('u-flow');
+  if (!d || !d.by_provider.length) {
+    host.innerHTML = '<div class="flow__empty">No requests in this range.<br/>' +
+      'Pick a wider range or send a request to populate this.</div>';
+    $('u-flow-note').textContent = '';
+    return;
+  }
+  const provs = d.by_provider.slice(0, 6);
+  const total = d.by_provider.reduce((a, p) => a + p.requests, 0);
+  const W = 620, H = 320, cx = W / 2, cy = H / 2;
+  const rx = Math.min(W * 0.34, 190), ry = Math.min(H * 0.34, 105);
+  const nodes = provs.map((p, i) => {
+    const ang = -Math.PI / 2 + (i * 2 * Math.PI) / provs.length;
+    return {p, x: cx + Math.cos(ang) * rx, y: cy + Math.sin(ang) * ry, ang};
+  });
+
+  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Request distribution across providers">`;
+  nodes.forEach(n => {
+    const share = n.p.requests / total;
+    svg += `<line x1="${cx}" y1="${cy}" x2="${n.x.toFixed(1)}" y2="${n.y.toFixed(1)}" ` +
+           `stroke="var(--line-strong)" stroke-width="${(1 + share * 4).toFixed(2)}"/>`;
+  });
+  svg += `<circle cx="${cx}" cy="${cy}" r="46" fill="var(--panel-2)" stroke="var(--acc)" stroke-width="1.5"/>` +
+         `<text x="${cx}" y="${cy - 4}" text-anchor="middle" fill="var(--txt)" font-size="13" font-weight="700">Router</text>` +
+         `<text x="${cx}" y="${cy + 13}" text-anchor="middle" fill="var(--mut)" font-size="11">${compact(total)} req</text>`;
+
+  nodes.forEach(n => {
+    const share = n.p.requests / total;
+    const label = n.p.provider.length > 18 ? n.p.provider.slice(0, 17) + '…' : n.p.provider;
+    const anchor = Math.abs(n.x - cx) < 6 ? 'middle' : (n.x > cx ? 'start' : 'end');
+    svg += `<circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${(20 + share * 22).toFixed(1)}" ` +
+           `fill="var(--acc-a20)" stroke="var(--acc)" stroke-width="1.25"/>` +
+           `<text x="${n.x.toFixed(1)}" y="${(n.y - 2).toFixed(1)}" text-anchor="${anchor}" fill="var(--txt)" font-size="12" font-weight="650">${esc(label)}</text>` +
+           `<text x="${n.x.toFixed(1)}" y="${(n.y + 13).toFixed(1)}" text-anchor="${anchor}" fill="var(--mut)" font-size="10">${fmt(n.p.requests)} · ${Math.round(share*100)}%</text>`;
+  });
+  svg += '</svg>';
+  host.innerHTML = svg;
+  $('u-flow-note').textContent = `${provs.length} of ${d.by_provider.length} providers`;
+}
+
+function renderRecent(){
+  const d = USAGE.data;
+  const body = $('u-recent');
+  if (!d || !d.recent.length) {
+    body.innerHTML = '<tr><td colspan="4" class="hint">Nothing yet.</td></tr>';
+    $('u-recent-note').textContent = '';
+    return;
+  }
+  body.innerHTML = d.recent.slice(0, 40).map(l => {
+    const mark = l.ok ? 'var(--ok)' : 'var(--err)';
+    return `<tr><td><span style="color:${mark}">●</span> <code>${esc(l.model)}</code></td>` +
+      `<td class="num-cell">${fmt(l.input_tokens)}</td>` +
+      `<td class="num-cell">${fmt(l.output_tokens)}</td>` +
+      `<td class="hint">${esc(ago(l.ts))}</td></tr>`;
+  }).join('');
+  $('u-recent-note').textContent = `${d.recent.length} shown · ${fmt(d.retained_logs)} retained`;
+}
+
+/* --- line chart over the bucket series ---------------------------------- */
+function chartValues(){
+  const d = USAGE.data;
+  const pts = (d && d.series) || [];
+  if (USAGE.metric === 'requests') return pts.map(p => p.requests);
+  if (USAGE.metric === 'cost') {
+    if (!d || !d.pricing_configured) return pts.map(() => null);
+    return pts.map(p => p.cost);
+  }
+  return pts.map(p => p.input_tokens + p.output_tokens);
+}
+
+function renderChart(){
+  const host = $('u-chart');
+  const d = USAGE.data;
+  const vals = chartValues();
+  if (USAGE.metric === 'cost' && d && !d.pricing_configured) {
+    host.innerHTML = '<div class="empty">Cost needs a price list.<br/>' +
+      'Add <code>settings.pricing</code> as <code>{"model": {"input": perM, "output": perM}}</code> ' +
+      'and this fills in.</div>';
+    return;
+  }
+  if (!d || !d.series.length || vals.every(v => !v)) {
+    host.innerHTML = '<div class="empty">No traffic in this range to plot.</div>';
+    return;
+  }
+  const W = 960, H = 260, padL = 56, padR = 16, padT = 16, padB = 28;
+  const max = Math.max(...vals, 1);
+  const iw = W - padL - padR, ih = H - padT - padB;
+  const x = i => padL + (d.series.length < 2 ? iw / 2 : (i / (d.series.length - 1)) * iw);
+  const y = v => padT + ih - (v / max) * ih;
+
+  let s = `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Usage over time">`;
+  for (let g = 0; g <= 4; g++) {
+    const gy = padT + (ih / 4) * g;
+    s += `<line class="chart__grid" x1="${padL}" y1="${gy}" x2="${W-padR}" y2="${gy}"/>` +
+         `<text class="chart__axis" x="${padL-8}" y="${gy+3}" text-anchor="end">${compact(max - (max/4)*g)}</text>`;
+  }
+  const step = Math.max(1, Math.ceil(d.series.length / 8));
+  d.series.forEach((p, i) => {
+    if (i % step && i !== d.series.length - 1) return;
+    const label = USAGE.metric === 'requests' && d.bucket === 'hour'
+      ? p.t.slice(11, 16) : p.t.slice(5);
+    s += `<text class="chart__axis" x="${x(i).toFixed(1)}" y="${H-8}" text-anchor="middle">${esc(label)}</text>`;
+  });
+  const pts = vals.map((v, i) => `${x(i).toFixed(1)},${y(v || 0).toFixed(1)}`);
+  s += `<polygon class="chart__area" points="${padL},${padT+ih} ${pts.join(' ')} ${padL+iw},${padT+ih}"/>` +
+       `<polyline class="chart__line" points="${pts.join(' ')}"/>`;
+  vals.forEach((v, i) => { if (v) s += `<circle class="chart__dot" cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="2.5"/>`; });
+  s += '</svg>';
+  host.innerHTML = s;
+}
+
+function barsFor(rows, valFn, fmtFn){
+  if (!rows.length) return '<div class="empty">No data.</div>';
+  const max = Math.max(...rows.map(valFn), 1);
+  return '<div class="bars">' + rows.map(r => {
+    const v = valFn(r), w = Math.round(100 * v / max);
+    return `<div class="barrow"><span class="barrow__name" title="${esc(r.label)}">${esc(r.label)}</span>` +
+      `<span class="barrow__track"><span class="barrow__fill" style="transform:scaleX(${(v/max).toFixed(4)})"></span></span>` +
+      `<span class="barrow__val">${esc(fmtFn(v))}</span></div>`;
+  }).join('') + '</div>';
+}
+
+function renderBars(){
+  const d = USAGE.data;
+  if (!d) return;
+  const val = USAGE.metric === 'requests' ? r => r.requests
+            : USAGE.metric === 'cost' ? r => (r.cost || 0)
+            : r => r.input_tokens + r.output_tokens;
+  const fmtVal = USAGE.metric === 'cost' ? money : compact;
+
+  $('u-by-provider').innerHTML = barsFor(
+    d.by_provider.map(p => ({label: p.provider, ...p})), val, fmtVal);
+  $('u-by-model').innerHTML = barsFor(
+    d.by_model.slice(0, 8).map(m => ({label: m.model, ...m})), val, fmtVal);
+}
+
+function renderModelTable(){
+  const d = USAGE.data;
+  const body = $('u-models');
+  if (!d || !d.by_model.length) {
+    body.innerHTML = '<tr><td colspan="8" class="hint">No model usage in this range.</td></tr>';
+    $('u-model-note').textContent = '';
+    return;
+  }
+  body.innerHTML = d.by_model.map(m => {
+    const lat = m.avg_latency_ms ? fmt(m.avg_latency_ms) + ' ms' : '—';
+    const cost = d.pricing_configured ? money(m.cost) : '—';
+    // the expander carries its own numbers so opening a row needs no refetch
+    const q = `onclick="toggleModel(this)" data-req="${fmt(m.requests)}"` +
+      ` data-ok="${fmt(m.ok)}" data-err="${fmt(m.err)}"` +
+      ` data-last="${esc((m.last_used || '').slice(0, 19).replace('T', ' ') || 'never')}"`;
+    return `<tr>` +
+      `<td><button class="model-toggle" aria-expanded="false" ${q}>›</button><code>${esc(m.model)}</code></td>` +
+      `<td class="hint">${esc(m.provider)}</td>` +
+      `<td class="num-cell">${fmt(m.requests)}</td>` +
+      `<td class="hint">${esc(ago(m.last_used))}</td>` +
+      `<td class="num-cell">${fmt(m.input_tokens)}</td>` +
+      `<td class="num-cell">${fmt(m.output_tokens)}</td>` +
+      `<td class="num-cell">${lat}</td>` +
+      `<td class="num-cell">${cost}</td></tr>`;
+  }).join('');
+  $('u-model-note').textContent = d.pricing_configured
+    ? 'cost from your price list'
+    : 'cost hidden — no pricing configured';
+}
+
+function toggleModel(btn){
+  const open = btn.getAttribute('aria-expanded') === 'true';
+  btn.setAttribute('aria-expanded', String(!open));
+  const row = btn.closest('tr');
+  const next = row.nextElementSibling;
+  if (open && next && next.classList.contains('model-detail')) next.remove();
+  if (!open && !next?.classList.contains('model-detail')) {
+    const tr = document.createElement('tr');
+    tr.className = 'model-detail';
+    const tds = row.children.length;
+    tr.innerHTML = `<td colspan="${tds}" class="hint">` +
+      `Requests: ${fmt(btn.dataset.req)} ok ${fmt(btn.dataset.ok)} / failed ${fmt(btn.dataset.err)} · ` +
+      `last used ${esc(btn.dataset.last)}</td>`;
+    row.after(tr);
+  }
+}
+
+function renderUsage(){
+  renderUsageStats();
+  renderFlow();
+  renderRecent();
+  renderChart();
+  renderBars();
+  renderModelTable();
+}
+
+function loadUsage(){
+  fetch('/admin/api/usage?range=' + encodeURIComponent(USAGE.range))
+    .then(r => r.json())
+    .then(d => { USAGE.data = d; renderUsage(); })
+    .catch(() => { USAGE.data = null; renderUsage(); });
+}
+
+document.querySelectorAll('[data-usetab]').forEach(b => b.onclick = () => {
+  USAGE.view = b.dataset.usetab;
+  setView('usetab', document.querySelectorAll('[data-usetab]'));
+  $('use-overview').classList.toggle('hidden', USAGE.view !== 'overview');
+  $('use-details').classList.toggle('hidden', USAGE.view !== 'details');
+});
+document.querySelectorAll('[data-range]').forEach(b => b.onclick = () => {
+  USAGE.range = b.dataset.range;
+  setView('range', document.querySelectorAll('[data-range]'));
+  loadUsage();
+});
+document.querySelectorAll('[data-metric]').forEach(b => b.onclick = () => {
+  USAGE.metric = b.dataset.metric;
+  setView('metric', document.querySelectorAll('[data-metric]'));
+  renderChart();
+  renderBars();
+});
+
+/* ==========================================================================
+   Endpoint tab — Local only. No tunnel, no tailnet: both are deployment
+   choices the operator makes outside this panel, and guessing at them here
+   would show a URL that may not be the one anything is listening on.
+   ========================================================================== */
+function endpointBase(){
+  const url = new URL(window.location.href);
+  return url.origin + '/v1';
+}
+
+async function copyEndpoint(){
+  const t = endpointBase();
+  try {
+    await navigator.clipboard.writeText(t);
+    flash($('ep-url'), 'copied');
+  } catch (e) {
+    prompt('Copy the endpoint:', t);
+  }
+}
+function flash(el, text){
+  const was = el.textContent;
+  el.textContent = text;
+  setTimeout(() => { el.textContent = was; }, 900);
+}
+
+async function epCreateKey(){
+  const label = ($('ep-label').value || '').trim() || 'user';
+  const r = await fetch('/admin/api/router-keys', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({label})
+  });
+  const j = await r.json();
+  if (!r.ok) { epNotice(j.error || 'could not create the key', 'err'); return; }
+  $('ep-label').value = '';
+  await epLoadKeys();
+  epNotice('Key created. Copy it now — it is never shown again.', 'ok', j.key);
+}
+
+async function epDeleteKey(id){
+  if (!confirm('Revoke this key? Clients using it stop working immediately.')) return;
+  await fetch('/admin/api/router-keys/' + encodeURIComponent(id), {method: 'DELETE'});
+  await epLoadKeys();
+  await epLoadAuth();
+  refresh();
+}
+
+function epNotice(msg, kind, key){
+  $('ep-notice').innerHTML = `<div class="notice notice--${kind === 'err' ? 'err' : 'ok'}" style="margin-top:14px">` +
+    `<div><div>${esc(msg)}</div>` +
+    (key ? `<div class="row"><code style="flex:1;word-break:break-all">${esc(key)}</code>` +
+           `<button onclick="copyText(this.previousElementSibling.textContent)">Copy</button></div>` : '') +
+    `</div></div>`;
+}
+
+async function epLoadAuth(){
+  const j = await (await fetch('/admin/api/router-auth')).json();
+  const box = $('ep-require');
+  box.checked = !!j.require_api_key;
+  // The panel will refuse the flip server-side; disabling it here is the hint.
+  const canRequire = j.key_count > 0 || j.env_key;
+  box.disabled = !canRequire && !j.require_api_key;
+  if (!canRequire && !j.require_api_key) {
+    $('ep-notice').innerHTML = '<div class="notice" style="margin-top:14px">' +
+      '<div>No API keys exist, so the router is open to anyone who can reach it. ' +
+      'Create a key first — requiring one with none defined would lock every client out.</div></div>';
+  } else {
+    $('ep-notice').innerHTML = '';
+  }
+}
+
+async function epSetRequire(want){
+  const r = await fetch('/admin/api/router-auth', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({require_api_key: want})
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    $('ep-require').checked = !want;   // the server refused; put the switch back
+    epNotice(j.error || 'could not change the setting', 'err');
+    return;
+  }
+  refresh();
+}
+
+async function epLoadKeys(){
+  const s = await (await fetch('/admin/api/state')).json();
+  const keys = s.router_keys || [];
+  $('ep-keys').innerHTML = keys.map(k =>
+    `<div class="keycard">
+      <div class="keycard__top">
+        <span class="keycard__label">${esc(k.label || 'user')}</span>
+        <span class="keycard__actions">
+          <button onclick="copyText('${esc(k.masked || '')}')">Copy masked</button>
+          <button class="danger" onclick="epDeleteKey('${esc(k.id)}')">Revoke</button>
+        </span>
+      </div>
+      <span class="keycard__mask">${esc(k.masked || '')}</span>
+      <span class="keycard__meta">created ${esc((k.created_at || '').slice(0, 10)) || '—'}
+        · last used ${esc(k.last_used_at ? ago(k.last_used_at) : 'never')}
+        · ${fmt(k.request_count)} requests</span>
+    </div>`).join('')
+    || '<div class="empty" style="margin-top:14px">No API keys yet.<br/>Create one to hand a client its own credential.</div>';
+}
+
+function epInit(){
+  $('ep-url').textContent = endpointBase();
+  epLoadAuth();
+  epLoadKeys();
+}
+
+/* the sidebar switcher runs on click; hook the lazy work to it */
+const _usageLoaded = {done: false};
+document.querySelectorAll('.sidebar nav button').forEach(b => {
+  const prev = b.onclick;
+  b.onclick = () => {
+    if (prev) prev.call(b);
+    if (b.dataset.tab === 'usage' && !_usageLoaded.done) { _usageLoaded.done = true; loadUsage(); }
+    if (b.dataset.tab === 'endpoint') epInit();
+  };
+});
+
 refresh();
 </script>
 </body>

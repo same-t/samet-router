@@ -1162,6 +1162,38 @@ def test_free_lane_routes_to_inference_v2(tmp_path, monkeypatch):
     assert r.get_json()["choices"][0]["message"]["content"] == "pong"
 
 
+def test_free_lane_replays_reasoning_content(tmp_path, monkeypatch):
+    """OpenCode/DeepSeek thinking mode rejects a tool-call history without it."""
+    c = make_client(tmp_path)
+    _add_opencode_upstream(c)
+    seen = {}
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return fake_openai_chat("pong")
+
+    def fake_post(url, **kw):
+        seen["json"] = kw["json"]
+        return R()
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    r = c.post("/v1/chat/completions", json={
+        "model": "oc/mimo-v2.6-flash-free",
+        "messages": [
+            {"role": "user", "content": "hava?"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "w", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "gunesli"},
+        ]})
+    assert r.status_code == 200, r.text
+    assistants = [m for m in seen["json"]["messages"] if m.get("role") == "assistant"]
+    assert assistants and assistants[0]["reasoning_content"] == ""
+
+
 def test_paid_lane_still_uses_zen_v1(tmp_path, monkeypatch):
     """A non-free OpenCode model must stay on /zen/v1 with the connection key."""
     c = make_client(tmp_path)
@@ -2171,6 +2203,46 @@ def test_apply_thinking_default():
     assert g["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 4096
     router.apply_thinking_default(g, "gemini", "off")
     assert "thinkingConfig" not in g["generationConfig"]
+
+
+def test_ensure_openai_reasoning_replay():
+    def history():
+        return {"messages": [
+            {"role": "user", "content": "hava?"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "w", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "gunesli"},
+            {"role": "assistant", "content": "Gunesli."},
+        ]}
+
+    # vanilla OpenAI does not use reasoning_content
+    b = history()
+    assert router.ensure_openai_reasoning_replay(b, "gpt-4o-mini", "openai") is False
+    assert all("reasoning_content" not in m for m in b["messages"])
+
+    # DeepSeek-style thinking model: every assistant message gets the field
+    b = history()
+    assert router.ensure_openai_reasoning_replay(b, "deepseek-v4-flash", "custom") is True
+    assert [m.get("reasoning_content") for m in b["messages"] if m["role"] == "assistant"] == ["", ""]
+
+    # OpenCode Zen / Command Code need it even when the model name carries no hint
+    for provider in ("opencode", "commandcode"):
+        b = history()
+        assert router.ensure_openai_reasoning_replay(
+            b, "mimo-v2.6-flash-free", provider) is True
+        assert all(m.get("reasoning_content") == "" for m in b["messages"]
+                   if m["role"] == "assistant")
+
+    # existing reasoning is preserved, and "off" leaves the body untouched
+    b = {"messages": [{"role": "assistant", "content": "x",
+                       "reasoning_content": "dusundum"}]}
+    assert router.ensure_openai_reasoning_replay(b, "deepseek-v4", "custom") is False
+    assert b["messages"][0]["reasoning_content"] == "dusundum"
+    b = {"messages": [{"role": "assistant", "content": "x"}]}
+    assert router.ensure_openai_reasoning_replay(
+        b, "deepseek-v4", "custom", "off") is False
+    assert "reasoning_content" not in b["messages"][0]
 
 
 def test_admin_provider_page_and_detail(tmp_path):

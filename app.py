@@ -51,7 +51,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -755,6 +755,238 @@ def generate_router_key() -> tuple[str, str]:
     rand = uuid.uuid4().hex + uuid.uuid4().hex[:8]
     full = f"sk-samet-{rand[:24]}"
     return full, full[:11] + "..." + full[-4:]
+
+
+def router_auth_enabled(data: dict) -> bool:
+    """Whether a request without a valid key is rejected.
+
+    The stored setting wins when present. When it is absent the panel behaves
+    exactly as it did before the toggle existed — auth on iff a key exists —
+    so upgrading never changes who can reach the API. The toggle exists for the
+    case the old rule could not express: keys you create for tracking without
+    closing the router.
+    """
+    st = data.get("settings") or {}
+    if "require_api_key" in st:
+        return bool(st.get("require_api_key"))
+    return bool(ROUTER_API_KEY or data.get("router_keys"))
+
+
+# --- usage & analytics ------------------------------------------------------
+# `range` -> (bucket size, window). `None` means "everything retained", which is
+# capped by the logs ring buffer rather than by the window.
+USAGE_RANGES: dict[str, tuple[str, timedelta | None]] = {
+    "1h":  ("hour", timedelta(hours=1)),
+    "24h": ("hour", timedelta(hours=24)),
+    "7d":  ("day",  timedelta(days=7)),
+    "30d": ("day",  timedelta(days=30)),
+    "60d": ("day",  timedelta(days=60)),
+    "all": ("day",  None),
+}
+
+
+def _parse_ts(value: object) -> datetime | None:
+    """Log timestamps are ISO strings written by _now_iso()."""
+    s = str(value or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _bucket_key(dt: datetime, bucket: str) -> str:
+    if bucket == "hour":
+        return dt.strftime("%Y-%m-%dT%H:00")
+    return dt.strftime("%Y-%m-%d")
+
+
+def _blank_point(key: str) -> dict:
+    return {"t": key, "requests": 0, "ok": 0, "err": 0,
+            "input_tokens": 0, "output_tokens": 0}
+
+
+def _fill_gaps(points: dict[str, dict], start: datetime, end: datetime,
+               bucket: str) -> list[dict]:
+    """A gap in the series is a zero, not a missing row.
+
+    Without this a chart silently draws a straight line across an hour in which
+    nothing was requested, which reads as traffic that never happened.
+    """
+    out, cur = [], start
+    step = timedelta(hours=1) if bucket == "hour" else timedelta(days=1)
+    if bucket == "hour":
+        cur = cur.replace(minute=0, second=0, microsecond=0)
+    else:
+        cur = cur.replace(hour=0, minute=0, second=0, microsecond=0)
+    guard = 0
+    while cur <= end and guard < 2000:
+        key = _bucket_key(cur, bucket)
+        out.append(points.get(key) or _blank_point(key))
+        cur += step
+        guard += 1
+    return out
+
+
+def _cost(pricing: dict, model: str, inp: int, out: int) -> float | None:
+    """Cost from the operator's own price list. None when unpriced.
+
+    There is no bundled price table on purpose: a made-up rate would turn every
+    cost figure on the page into a number that means nothing. An entry that
+    happens to price everything at zero is a real answer, so "absent" and
+    "present but zero" have to stay distinguishable — hence no `or {}`.
+    """
+    if not isinstance(pricing, dict):
+        return None
+    entry = pricing.get(model)
+    if entry is None:
+        entry = pricing.get("*")
+    if not isinstance(entry, dict) or not entry:
+        return None
+    try:
+        return round(inp / 1e6 * float(entry.get("input", 0))
+                     + out / 1e6 * float(entry.get("output", 0)), 6)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_usage(data: dict, rng: str) -> dict:
+    """Everything the Usage page renders, derived from the logs ring buffer."""
+    bucket, window = USAGE_RANGES[rng]
+    logs = data.get("logs", []) or []
+    settings = data.get("settings") or {}
+    pricing = settings.get("pricing") or {}
+    now = datetime.now(timezone.utc)
+    cutoff = now - window if window else None
+
+    rows = []
+    for l in logs:
+        dt = _parse_ts(l.get("ts"))
+        if dt is None:
+            continue
+        if cutoff and dt < cutoff:
+            continue
+        rows.append((dt, l))
+
+    points: dict[str, dict] = {}
+    models: dict[str, dict] = {}
+    providers: dict[str, dict] = {}
+    totals = {"requests": 0, "ok": 0, "err": 0,
+              "input_tokens": 0, "output_tokens": 0}
+    lat: list[int] = []
+
+    for dt, l in rows:
+        key = _bucket_key(dt, bucket)
+        p = points.setdefault(key, _blank_point(key))
+        ok = bool(l.get("ok"))
+        try:
+            inp = int(l.get("input_tokens", 0) or 0)
+            out = int(l.get("output_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            inp = out = 0
+
+        p["requests"] += 1
+        p["ok" if ok else "err"] += 1
+        p["input_tokens"] += inp
+        p["output_tokens"] += out
+        totals["requests"] += 1
+        totals["ok" if ok else "err"] += 1
+        totals["input_tokens"] += inp
+        totals["output_tokens"] += out
+        if isinstance(l.get("latency_ms"), (int, float)):
+            lat.append(int(l["latency_ms"]))
+
+        mname = str(l.get("model", "") or "?")
+        m = models.setdefault(mname, {
+            "model": mname, "provider": str(l.get("provider", "") or "?"),
+            "requests": 0, "ok": 0, "err": 0,
+            "input_tokens": 0, "output_tokens": 0, "lat_sum": 0, "lat_n": 0,
+            "last_used": "",
+        })
+        m["requests"] += 1
+        m["ok" if ok else "err"] += 1
+        m["input_tokens"] += inp
+        m["output_tokens"] += out
+        if isinstance(l.get("latency_ms"), (int, float)):
+            m["lat_sum"] += int(l["latency_ms"]); m["lat_n"] += 1
+        iso = str(l.get("ts", "") or "")
+        if iso > m["last_used"]:
+            m["last_used"] = iso
+
+        pv = str(l.get("provider", "") or "?")
+        pr = providers.setdefault(pv, {
+            "provider": pv, "requests": 0, "input_tokens": 0,
+            "output_tokens": 0, "last_used": "",
+        })
+        pr["requests"] += 1
+        pr["input_tokens"] += inp
+        pr["output_tokens"] += out
+        if iso > pr["last_used"]:
+            pr["last_used"] = iso
+
+    by_model = []
+    for m in models.values():
+        m = dict(m)
+        m["total_tokens"] = m["input_tokens"] + m["output_tokens"]
+        m["avg_latency_ms"] = int(m["lat_sum"] / m["lat_n"]) if m["lat_n"] else 0
+        m.pop("lat_sum", None); m.pop("lat_n", None)
+        m["cost"] = _cost(pricing, m["model"], m["input_tokens"], m["output_tokens"])
+        by_model.append(m)
+    by_model.sort(key=lambda m: -m["requests"])
+
+    by_provider = sorted(providers.values(),
+                         key=lambda p: -p["requests"])
+    for p in by_provider:
+        p["total_tokens"] = p["input_tokens"] + p["output_tokens"]
+
+    start = min((dt for dt, _ in rows), default=now - (window or timedelta(days=7)))
+    series = _fill_gaps(points, start, now, bucket)
+
+    total_cost = None
+    if by_model and all(m["cost"] is not None for m in by_model):
+        total_cost = round(sum(m["cost"] for m in by_model), 4)
+
+    recent = []
+    for dt, l in sorted(rows, key=lambda r: r[0], reverse=True)[:60]:
+        try:
+            ri = int(l.get("input_tokens", 0) or 0)
+            ro = int(l.get("output_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            ri = ro = 0
+        recent.append({
+            "ts": l.get("ts", ""), "model": l.get("model", ""),
+            "provider": l.get("provider", ""), "ok": bool(l.get("ok")),
+            "input_tokens": ri, "output_tokens": ro,
+            "latency_ms": l.get("latency_ms"), "error": l.get("error", ""),
+            "api_key_label": l.get("api_key_label", ""),
+            "endpoint": l.get("endpoint", ""),
+        })
+
+    return {
+        "range": rng,
+        "bucket": bucket,
+        "generated_at": now.isoformat(),
+        "summary": {
+            "total_requests": totals["requests"],
+            "ok": totals["ok"],
+            "err": totals["err"],
+            "success_rate": round(100.0 * totals["ok"] / totals["requests"], 1)
+                            if totals["requests"] else 0,
+            "input_tokens": totals["input_tokens"],
+            "output_tokens": totals["output_tokens"],
+            "total_tokens": totals["input_tokens"] + totals["output_tokens"],
+            "avg_latency_ms": int(sum(lat) / len(lat)) if lat else 0,
+            "cost": total_cost,
+        },
+        "series": series,
+        "by_model": by_model,
+        "by_provider": by_provider,
+        "recent": recent,
+        "pricing_configured": bool(pricing),
+        "retained_logs": len(logs),
+    }
 
 
 def mask_router_key(entry: dict) -> dict:
@@ -1796,6 +2028,58 @@ def sanitize_openai_body_for_retry(obody: dict) -> tuple[dict, list[str]]:
     except (AttributeError, TypeError):
         pass
     return body, removed
+
+
+# DeepSeek/OpenCode-style thinking mode requires `reasoning_content` to be
+# passed back on assistant messages. OpenAI SDKs drop this non-standard field
+# when rebuilding history, so the next turn after a tool call fails with
+# "The `reasoning_content` in the thinking mode must be passed back to the API".
+_REASONING_MODEL_HINTS = ("deepseek", "reasoner", "qwq", "thinking", "thinking-free")
+
+
+def _openai_wants_reasoning_replay(body: dict, messages: list, upstream_model: str,
+                                   provider_id: str) -> bool:
+    if body.get("reasoning_effort"):
+        return True
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if "reasoning_content" in msg:
+            return True
+        content = msg.get("content")
+        if isinstance(content, list) and any(
+                isinstance(p, dict) and p.get("type") in ("reasoning", "reasoning_content")
+                for p in content):
+            return True
+    if (provider_id or "").strip().lower() in ("opencode", "commandcode"):
+        return True
+    model = (upstream_model or "").lower()
+    return any(h in model for h in _REASONING_MODEL_HINTS)
+
+
+def ensure_openai_reasoning_replay(body: dict, upstream_model: str = "",
+                                   provider_id: str = "", mode: str = "auto") -> bool:
+    """Inject a placeholder `reasoning_content` on assistant messages (in place).
+
+    Thinking-mode upstreams (DeepSeek, OpenCode Zen) validate that every
+    assistant message carries the field, even when the client dropped it.
+    An empty string satisfies the validator; returns True when we added one.
+    `mode == "off"` means the provider disabled thinking, so leave the body.
+    """
+    if not isinstance(body, dict) or (mode or "auto").strip().lower() == "off":
+        return False
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+    if not _openai_wants_reasoning_replay(body, messages, upstream_model, provider_id):
+        return False
+    injected = False
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "assistant" \
+                and msg.get("reasoning_content") is None:
+            msg["reasoning_content"] = ""
+            injected = True
+    return injected
 
 
 def describe_openai_body(obody: dict) -> str:
@@ -3537,20 +3821,22 @@ def create_app() -> Flask:
         """Router auth: env ROUTER_API_KEY or panel-generated router_keys.
 
         Returns: (ok, error_response, key_info). key_info = {"id","label"}.
-        If no key is defined at all (local mode), everyone passes and key_info
-        is returned empty.
+        `require_api_key` in settings decides whether a key is *required*; a
+        matching token is always *accepted* so attribution survives the toggle
+        being off. With the setting absent, the historical rule applies: auth
+        is on as soon as any key exists.
         """
         token = extract_bearer_token(request.headers)
         data = load_data()
         router_keys = data.get("router_keys", []) or []
-        if not ROUTER_API_KEY and not router_keys:
-            return True, None, {"id": "", "label": ""}
         if ROUTER_API_KEY and token == ROUTER_API_KEY:
             return True, None, {"id": "env", "label": "env:ROUTER_API_KEY"}
         for rk in router_keys:
             if token and token == rk.get("key"):
                 return True, None, {"id": rk.get("id", ""), "label": rk.get("label", "")}
-        return False, (jsonify({"error": "unauthorized, Bearer token or x-api-key required"}), 401), {"id": "", "label": ""}
+        if router_auth_enabled(data):
+            return False, (jsonify({"error": "unauthorized, Bearer token or x-api-key required"}), 401), {"id": "", "label": ""}
+        return True, None, {"id": "", "label": ""}
 
     def need_admin_auth():
         if not ADMIN_TOKEN:
@@ -3710,6 +3996,55 @@ def create_app() -> Flask:
             data["logs"] = []
             save_data(data)
         return jsonify({"ok": True})
+
+    # ------------------------------------------------------------------
+    # Router auth switch
+    # ------------------------------------------------------------------
+    @app.get("/admin/api/router-auth")
+    def admin_get_router_auth():
+        if (err := need_admin_auth()) is not None:
+            return err
+        data = load_data()
+        return jsonify({
+            "require_api_key": router_auth_enabled(data),
+            "explicit": "require_api_key" in (data.get("settings") or {}),
+            "key_count": len(data.get("router_keys", []) or []),
+            "env_key": bool(ROUTER_API_KEY),
+        })
+
+    @app.post("/admin/api/router-auth")
+    def admin_set_router_auth():
+        if (err := need_admin_auth()) is not None:
+            return err
+        body = request.get_json(force=True, silent=True) or {}
+        want = bool(body.get("require_api_key"))
+        data = load_data()
+        # Turning this on with nothing to authenticate against is the one
+        # irreversible mistake available in this panel, so it is refused.
+        if want and not (data.get("router_keys") or []) and not ROUTER_API_KEY:
+            return jsonify({
+                "error": "no API keys exist — create one before requiring it, "
+                         "otherwise every client is locked out"
+            }), 409
+        with _lock:
+            data = load_data()
+            data.setdefault("settings", {})["require_api_key"] = want
+            save_data(data)
+        return jsonify({"ok": True, "require_api_key": want,
+                        "router_auth_required": router_auth_enabled(data)})
+
+    # ------------------------------------------------------------------
+    # Usage & analytics
+    # ------------------------------------------------------------------
+    @app.get("/admin/api/usage")
+    def admin_usage():
+        if (err := need_admin_auth()) is not None:
+            return err
+        data = load_data()
+        rng = (request.args.get("range") or "7d").strip().lower()
+        if rng not in USAGE_RANGES:
+            rng = "7d"
+        return jsonify(build_usage(data, rng))
 
     @app.post("/admin/api/router-keys")
     def admin_add_router_key():
@@ -4414,9 +4749,11 @@ def create_app() -> Flask:
                     up_body["messages"] = [
                         {"role": "system", "content": default_system.strip()},
                         *(messages or [])]
-                apply_thinking_default(
-                    up_body, "openai",
-                    get_provider_settings(data, target.get("provider_id") or "").get("thinking"))
+                _tmode = get_provider_settings(
+                    data, target.get("provider_id") or "").get("thinking")
+                apply_thinking_default(up_body, "openai", _tmode)
+                thinking = ensure_openai_reasoning_replay(
+                    up_body, upstream, target.get("provider_id") or "", _tmode) or thinking
                 oc: dict = {}
                 _entry, resp = call_upstream(
                     "openai", up_body, stream=stream or bool(oc.get("forced_stream")),
@@ -4661,9 +4998,11 @@ def create_app() -> Flask:
             if provider == "openai":
                 obody, _effort = anthropic_to_openai_body(body, default_system)
                 obody["model"] = upstream
-                apply_thinking_default(
-                    obody, "openai",
-                    get_provider_settings(data, target.get("provider_id") or "").get("thinking"))
+                _tmode = get_provider_settings(
+                    data, target.get("provider_id") or "").get("thinking")
+                apply_thinking_default(obody, "openai", _tmode)
+                thinking = ensure_openai_reasoning_replay(
+                    obody, upstream, target.get("provider_id") or "", _tmode) or thinking
                 # upstream OpenAI SSE cannot be converted to Anthropic SSE; buffer it
                 oc: dict = {}
                 _entry, resp = call_upstream("openai", obody, stream=False, timeout=60,
