@@ -2445,6 +2445,96 @@ def test_playground_stream(tmp_path, monkeypatch):
     assert '"he"' in body and '"llo"' in body
 
 
+def test_playground_uses_selected_account_while_cooling(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    _reset_circuit()
+    assert c.post("/admin/api/provider-keys", json={
+        "key": "sk-a", "label": "a", "provider": "openai"}).status_code == 201
+    assert c.post("/admin/api/provider-keys", json={
+        "key": "sk-b", "label": "b", "provider": "openai"}).status_code == 201
+    assert c.post("/admin/api/models", json={
+        "name": "m", "provider": "openai", "upstream_model": "gpt-x"}).status_code == 201
+    keys = [k for k in router.load_data()["provider_keys"] if k["provider"] == "openai"]
+    picked = keys[0]
+    router.mark_key_cooling(picked, 600)
+
+    seen = {}
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return fake_openai_chat("pong")
+
+    def fake_post(url, **kw):
+        seen["auth"] = kw["headers"]["Authorization"]
+        return R()
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    r = c.post("/admin/api/playground/chat", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "provider_key_id": picked["id"]})
+    assert r.status_code == 200, r.text
+    assert seen["auth"] == "Bearer sk-a"
+    # the picker can see why an account is parked
+    state = c.get("/admin/api/state").get_json()["provider_keys"]
+    row = [k for k in state if k["id"] == picked["id"]][0]
+    assert row["cooling_for"] > 0
+
+
+def test_playground_auto_sends_even_when_all_keys_cooling(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    _reset_circuit()
+    for key in ("sk-a", "sk-b"):
+        assert c.post("/admin/api/provider-keys", json={
+            "key": key, "provider": "openai"}).status_code == 201
+    assert c.post("/admin/api/models", json={
+        "name": "m", "provider": "openai", "upstream_model": "gpt-x"}).status_code == 201
+    for entry in router.load_data()["provider_keys"]:
+        if entry["provider"] == "openai":
+            router.mark_key_cooling(entry, 600)
+
+    hits = []
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return fake_openai_chat("pong")
+
+    monkeypatch.setattr(router.requests, "post",
+                        lambda url, **kw: (hits.append(url), R())[1])
+    r = c.post("/admin/api/playground/chat", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    assert hits
+
+
+def test_playground_returns_upstream_429_instead_of_cache(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    _reset_circuit()
+    assert c.post("/admin/api/provider-keys", json={
+        "key": "sk-a", "provider": "openai"}).status_code == 201
+    assert c.post("/admin/api/models", json={
+        "name": "m", "provider": "openai", "upstream_model": "gpt-x"}).status_code == 201
+
+    class R429:
+        status_code = 429
+        text = '{"error":{"message":"slow down"}}'
+
+        def json(self):
+            return {"error": {"message": "slow down"}}
+
+    monkeypatch.setattr(router.requests, "post", lambda *a, **k: R429())
+    r = c.post("/admin/api/playground/chat", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 429
+    assert r.get_json()["error"]["message"] == "slow down"
+    assert "X-Samet-Router" not in r.headers
+
+
 # --- OpenCode Console account (device-code OAuth) connection ---
 
 class _RJson:

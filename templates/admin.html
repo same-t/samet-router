@@ -245,6 +245,8 @@
       <div class="pg-toolbar">
         <label class="fld">Provider</label>
         <select id="pg-provider" onchange="pgProviderChanged()"></select>
+        <label class="fld">Account</label>
+        <select id="pg-key" title="Auto uses every account; picking one pins the request to it, even while it is cooling down."></select>
         <label class="fld">Model</label>
         <select id="pg-model"></select>
       </div>
@@ -673,6 +675,21 @@ function pgRender() {
   sel.value = provs.includes(prev) ? prev : (provs[0] || '');
   pgProviderChanged();
 }
+function pgKeyLabel(k) {
+  let s = k.label || k.key || k.id;
+  if (k.label && k.key) s += ' · ' + k.key;
+  if (Number(k.cooling_for) > 0) s += ` (cooling ${Math.ceil(Number(k.cooling_for))}s)`;
+  return s;
+}
+function pgRenderKeys(provider) {
+  const keys = ((STATE && STATE.provider_keys) || []).filter(k => (k.provider || 'gemini') === provider);
+  const sel = $('pg-key');
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">Auto — all accounts</option>'
+    + keys.map(k => `<option value="${esc(k.id)}">${esc(pgKeyLabel(k))}</option>`).join('');
+  sel.value = keys.some(k => k.id === prev) ? prev : '';
+}
 function pgProviderChanged() {
   const p = $('pg-provider').value;
   const models = ((STATE && STATE.models) || []).filter(m => !m.disabled && (m.provider || 'gemini') === p);
@@ -682,6 +699,7 @@ function pgProviderChanged() {
     `<option value="${esc(m.name)}">${esc(m.name)} → ${esc(m.upstream_model || m.gemini_model || '')}</option>`).join('')
     || '<option value="">no models</option>';
   if (models.some(m => m.name === prev)) sel.value = prev;
+  pgRenderKeys(p);
 }
 function pgAppend(role, text) {
   const wrap = document.createElement('div');
@@ -705,6 +723,7 @@ function pgClear() {
 async function pgSend() {
   const text = $('pg-text').value.trim();
   const model = $('pg-model').value;
+  const provider_key_id = $('pg-key') ? $('pg-key').value : '';
   if (!text) return;
   if (!model) return alert('select a model');
   if (document.querySelector('.pg-empty')) $('pg-chat').innerHTML = '';
@@ -718,7 +737,7 @@ async function pgSend() {
   try {
     const r = await fetch('/admin/api/playground/chat', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages: PG_HISTORY, stream: true }),
+      body: JSON.stringify({ model, messages: PG_HISTORY, stream: true, provider_key_id }),
     });
     if (!r.ok || !r.body) {
       const t = await r.text();

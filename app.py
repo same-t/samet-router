@@ -2758,8 +2758,21 @@ def _pool_for_protocol(data: dict, protocol: str, provider: str = "") -> list[di
     return keys
 
 
-def _ordered_pool(data: dict, protocol: str, provider: str = "") -> list[dict]:
+def _ordered_pool(data: dict, protocol: str, provider: str = "",
+                  key_id: str = "", ignore_cooldown: bool = False) -> list[dict]:
+    """Candidate keys in attempt order.
+
+    `key_id` pins one provider key (playground account picker). `ignore_cooldown`
+    still returns keys that are parked by a rate limit, so the request reaches
+    the upstream and the caller gets the upstream's own answer.
+    """
     pool = _pool_for_protocol(data, protocol, provider)
+    key_id = (key_id or "").strip()
+    if key_id:
+        pool = [k for k in pool if str(k.get("id") or "") == key_id]
+        if not pool:
+            raise RuntimeError(
+                "Selected account is not available for this provider/protocol.")
     if not pool:
         scope = f" for provider {provider}" if provider else ""
         raise RuntimeError(
@@ -2768,13 +2781,13 @@ def _ordered_pool(data: dict, protocol: str, provider: str = "") -> list[dict]:
     # lower priority number = tried first (1 is highest priority)
     pool = sorted(pool, key=lambda k: int(k.get("priority", 1) or 1))
     prune_cooldowns()
-    usable = [k for k in pool if not key_is_cooling(k)]
+    usable = pool if ignore_cooldown else [k for k in pool if not key_is_cooling(k)]
     if not usable:
         # keys exist but every one is serving a rate-limit cooldown
         worst = max((key_cooldown_remaining(k) for k in pool), default=0.0)
         raise AllKeysCoolingDown(worst, len(pool))
     round_robin = bool((data.get("settings", {}) or {}).get("round_robin", True))
-    if not round_robin:
+    if not round_robin or key_id:
         return usable
     cursor = pool_cursor(protocol, provider)
     start = int((data.get("provider_index", {}) or {}).get(cursor, 0) or 0) % len(usable)
@@ -3560,7 +3573,8 @@ class _RefusalResponse:
 def call_upstream(protocol: str, body: dict, gemini_model: str = "",
                   stream: bool = False, timeout=60,
                   extra_headers: dict | None = None, provider: str = "",
-                  oc_state: dict | None = None):
+                  oc_state: dict | None = None, key_id: str = "",
+                  ignore_cooldown: bool = False):
     """POST to upstream; returns (entry, response).
 
     Keys speaking the same protocol are tried round-robin; on 401/403/429
@@ -3570,12 +3584,14 @@ def call_upstream(protocol: str, body: dict, gemini_model: str = "",
 
     `provider` pins the pool to one provider (the model mapping's provider) so
     a request for a commandcode model never lands on another openai-protocol key.
+    `key_id` pins one provider key; with `ignore_cooldown` even a parked key is
+    used and a final 429 is returned instead of replaying a cached answer.
     `oc_state`, when a dict is passed, receives OpenCode v2 free-lane details
     ({rename, session, forced_stream}) so the handler can aggregate/restore.
     """
     with _lock:
         data = load_data()
-        pool = _ordered_pool(data, protocol, provider)
+        pool = _ordered_pool(data, protocol, provider, key_id, ignore_cooldown)
         proxies_for: dict[str, str | None] = {}
         for entry in pool:
             prov = entry.get("provider") or ""
@@ -3674,6 +3690,10 @@ def call_upstream(protocol: str, body: dict, gemini_model: str = "",
                 _close_quietly(resp)
                 last_exc = RuntimeError(f"upstream 429: {resp.text[:300]}")
                 continue
+            # Playground asks for the real upstream answer even when every key
+            # is parked, so hand the final 429 back instead of a cached replay.
+            if ignore_cooldown:
+                return entry, resp
             # pool held only usable keys, so parking this one empties it. Raise so
             # the handler can replay its cached response instead of surfacing a
             # bare 429 to the caller.
@@ -3688,10 +3708,12 @@ def call_upstream(protocol: str, body: dict, gemini_model: str = "",
 
 
 def call_gemini(gemini_model: str, payload: dict, timeout: int = 60,
-                provider: str = "") -> dict:
+                provider: str = "", key_id: str = "",
+                ignore_cooldown: bool = False) -> dict:
     """Legacy signature kept: JSON call with the gemini protocol, returns a dict."""
     _entry, resp = call_upstream("gemini", payload, gemini_model=gemini_model,
-                                 stream=False, timeout=timeout, provider=provider)
+                                 stream=False, timeout=timeout, provider=provider,
+                                 key_id=key_id, ignore_cooldown=ignore_cooldown)
     if resp.status_code != 200:
         raise RuntimeError(f"Gemini {resp.status_code}: {resp.text[:500]}")
     return resp.json()
@@ -4016,6 +4038,7 @@ def create_app() -> Flask:
                 "account": k.get("account", {}) or {},
                 "expires_at": k.get("expires_at", 0) or 0,
                 "key": mask_key(k.get("key", "")),
+                "cooling_for": round(key_cooldown_remaining(k), 1),
                 "created_at": k.get("created_at", "")}
 
     # --- Admin JSON API ---
@@ -4788,7 +4811,8 @@ def create_app() -> Flask:
                                      now, fallback=True))
 
     # --- Router: OpenAI compatible ---
-    def _chat_core(body: dict, key_info: dict, ep: str, forward_beta: dict | None = None):
+    def _chat_core(body: dict, key_info: dict, ep: str, forward_beta: dict | None = None,
+                   key_id: str = "", ignore_cooldown: bool = False):
         forward_beta = forward_beta or {}
         router_model = str(body.get("model", "")).strip() or "samet-flash"
         messages = body.get("messages", [])
@@ -4827,7 +4851,8 @@ def create_app() -> Flask:
                 _entry, resp = call_upstream(
                     "openai", up_body, stream=stream or bool(oc.get("forced_stream")),
                     timeout=STREAM_TIMEOUT if stream else 60,
-                    provider=target.get("provider_id") or "", oc_state=oc)
+                    provider=target.get("provider_id") or "", oc_state=oc,
+                    key_id=key_id, ignore_cooldown=ignore_cooldown)
                 # OpenCode free lane always streams upstream; aggregate for
                 # clients that asked for a single JSON response.
                 oc_streamed = bool(oc.get("forced_stream")) and not stream
@@ -4837,14 +4862,16 @@ def create_app() -> Flask:
                     retry_body.pop("stream_options", None)
                     _entry, resp = call_upstream(
                         "openai", retry_body, stream=True, timeout=STREAM_TIMEOUT,
-                        provider=target.get("provider_id") or "", oc_state=oc)
+                        provider=target.get("provider_id") or "", oc_state=oc,
+                        key_id=key_id, ignore_cooldown=ignore_cooldown)
                 if resp.status_code == 400 and not stream and not oc_streamed:
                     retry_body, removed = sanitize_openai_body_for_retry(up_body)
                     if removed:
                         _close_quietly(resp)
                         _entry2, resp2 = call_upstream(
                             "openai", retry_body, stream=False, timeout=60,
-                            provider=target.get("provider_id") or "", oc_state=oc)
+                            provider=target.get("provider_id") or "", oc_state=oc,
+                            key_id=key_id, ignore_cooldown=ignore_cooldown)
                         if resp2.status_code == 200:
                             resp = resp2
                             _entry = _entry2
@@ -4909,7 +4936,8 @@ def create_app() -> Flask:
                 _entry, resp = call_upstream(
                     "anthropic", abody, stream=False, timeout=60,
                     extra_headers=forward_beta,
-                    provider=target.get("provider_id") or "")
+                    provider=target.get("provider_id") or "",
+                    key_id=key_id, ignore_cooldown=ignore_cooldown)
                 if resp.status_code != 200:
                     add_log(ep, router_model, False, int((time.time() - t0) * 1000),
                             _cross_error_message("anthropic", resp),
@@ -4962,7 +4990,8 @@ def create_app() -> Flask:
                 include_thoughts=budget is not None,
             )
             g = call_gemini(gemini_model, payload,
-                             provider=target.get("provider_id") or "")
+                             provider=target.get("provider_id") or "",
+                             key_id=key_id, ignore_cooldown=ignore_cooldown)
             oai = gemini_to_openai_response(g, router_model)
             u = (oai.get("usage") or {})
             msg = (oai.get("choices") or [{}])[0].get("message") or {}
@@ -5008,8 +5037,9 @@ def create_app() -> Flask:
         if (err := need_admin_auth()) is not None:
             return err
         body = request.get_json(force=True, silent=True) or {}
+        key_id = str(body.pop("provider_key_id", "") or "").strip()
         return _chat_core(body, {"id": "playground", "label": "playground"},
-                          "playground", {})
+                          "playground", {}, key_id=key_id, ignore_cooldown=True)
 
     # --- Router: Anthropic compatible ---
     @app.post("/v1/messages")
