@@ -779,6 +779,85 @@ def test_stream_proxy_rewrites_model(tmp_path, monkeypatch):
     assert "[DONE]" in r.text
 
 
+def test_stream_logs_upstream_usage(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    _add_openai_upstream(c)
+    seen = {}
+
+    class R:
+        status_code = 200
+
+        def iter_content(self, chunk_size=4096):
+            yield (b'data: {"id": "1", "model": "gpt-4o-mini", '
+                   b'"choices": [{"index": 0, "delta": {"content": "hi"}}]}\n\n')
+            yield (b'data: {"choices": [], "usage": {"prompt_tokens": 11, '
+                   b'"completion_tokens": 5, "total_tokens": 16}}\n\n')
+            yield b"data: [DONE]\n\n"
+
+        def close(self):
+            pass
+
+    def fake_post(url, **kw):
+        seen["json"] = kw["json"]
+        return R()
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    r = c.post("/v1/chat/completions", json={
+        "model": "samet-oai", "messages": [{"role": "user", "content": "hi"}],
+        "stream": True})
+    assert r.status_code == 200
+    r.get_data()  # consume the stream so the finally-hook can log
+    assert seen["json"]["stream_options"]["include_usage"] is True
+    log = c.get("/admin/api/state").get_json()["logs"][0]
+    assert (log["input_tokens"], log["output_tokens"]) == (11, 5)
+
+
+def test_stream_logs_zero_when_usage_missing(tmp_path, monkeypatch):
+    """No estimation: an upstream without usage must be logged as 0/0."""
+    c = make_client(tmp_path)
+    _add_openai_upstream(c)
+
+    class R:
+        status_code = 200
+
+        def iter_content(self, chunk_size=4096):
+            yield (b'data: {"id": "1", "model": "gpt-4o-mini", '
+                   b'"choices": [{"index": 0, "delta": {"content": "hello world"}}]}\n\n')
+            yield b"data: [DONE]\n\n"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(router.requests, "post", lambda *a, **k: R())
+    r = c.post("/v1/chat/completions", json={
+        "model": "samet-oai", "messages": [{"role": "user", "content": "hi"}],
+        "stream": True})
+    assert r.status_code == 200
+    r.get_data()
+    log = c.get("/admin/api/state").get_json()["logs"][0]
+    assert (log["input_tokens"], log["output_tokens"]) == (0, 0)
+
+
+def test_nonstream_logs_zero_when_usage_missing(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    _add_openai_upstream(c)
+
+    class R:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return {"id": "1", "choices": [{"index": 0, "message": {
+                "role": "assistant", "content": "hello world"}}]}
+
+    monkeypatch.setattr(router.requests, "post", lambda *a, **k: R())
+    r = c.post("/v1/chat/completions", json={
+        "model": "samet-oai", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    log = c.get("/admin/api/state").get_json()["logs"][0]
+    assert (log["input_tokens"], log["output_tokens"]) == (0, 0)
+
+
 def test_converters_pure():
     # openai -> anthropic: tool + reasoning_effort
     abody, th = router.openai_to_anthropic_body({
@@ -1789,7 +1868,8 @@ def test_key_usage_counts_and_resets_on_429(tmp_path, monkeypatch):
     # total keeps climbing: the 429 request itself was still sent upstream
     assert row["requests_total"] == 4
     assert row["last_status"] == 429
-    assert 0 < row["last_429_in"] < 5
+    # Windows' clock resolution can make a just-recorded 429 report 0.0s
+    assert 0 <= row["last_429_in"] < 5
 
 
 def test_key_usage_survives_missing_headers(tmp_path, monkeypatch):

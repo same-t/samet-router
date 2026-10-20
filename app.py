@@ -3697,7 +3697,55 @@ def call_gemini(gemini_model: str, payload: dict, timeout: int = 60,
     return resp.json()
 
 
-def _rewrite_sse_line(line: bytes, router_model: str, rename: dict | None = None) -> bytes:
+def usage_token_pair(usage) -> tuple[int, int]:
+    """(input, output) from any of the three protocols' usage key names."""
+    u = usage if isinstance(usage, dict) else {}
+
+    def pick(*keys) -> int:
+        for k in keys:
+            try:
+                return int(u.get(k) or 0)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    return (pick("prompt_tokens", "input_tokens", "promptTokenCount"),
+            pick("completion_tokens", "output_tokens", "candidatesTokenCount"))
+
+
+def _sse_sink() -> dict:
+    return {"usage": {}, "reason_chars": 0}
+
+
+def _sse_absorb(sink, ev) -> None:
+    """Collect real usage + whether reasoning was streamed (OpenAI or Anthropic)."""
+    if not isinstance(sink, dict) or not isinstance(ev, dict):
+        return
+    u = ev.get("usage")
+    if not (isinstance(u, dict) and u):
+        msg = ev.get("message")
+        if isinstance(msg, dict):
+            u = msg.get("usage")
+    if isinstance(u, dict) and u:
+        sink["usage"].update(u)
+    for choice in ev.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        d = choice.get("delta")
+        if not isinstance(d, dict):
+            d = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        rc = d.get("reasoning_content")
+        if isinstance(rc, str) and rc:
+            sink["reason_chars"] += len(rc)
+    # Anthropic streaming: content_block_delta carries text/thinking
+    delta = ev.get("delta")
+    if isinstance(delta, dict) and delta.get("type") == "thinking_delta" \
+            and isinstance(delta.get("thinking"), str):
+        sink["reason_chars"] += len(delta["thinking"])
+
+
+def _rewrite_sse_line(line: bytes, router_model: str, rename: dict | None = None,
+                      sink: dict | None = None) -> bytes:
     try:
         s = line.decode("utf-8", "replace")
     except Exception:
@@ -3710,6 +3758,8 @@ def _rewrite_sse_line(line: bytes, router_model: str, rename: dict | None = None
             except (ValueError, TypeError):
                 return line
             if isinstance(j, dict):
+                if sink is not None:
+                    _sse_absorb(sink, j)
                 if isinstance(j.get("model"), str):
                     j["model"] = router_model
                 msg = j.get("message")
@@ -3721,7 +3771,8 @@ def _rewrite_sse_line(line: bytes, router_model: str, rename: dict | None = None
     return line
 
 
-def rewrite_sse_model(chunks, router_model: str, rename: dict | None = None):
+def rewrite_sse_model(chunks, router_model: str, rename: dict | None = None,
+                      sink: dict | None = None):
     """Replace the model name in the upstream SSE stream with the router name (pure generator)."""
     buf = b""
     for chunk in chunks or []:
@@ -3730,19 +3781,31 @@ def rewrite_sse_model(chunks, router_model: str, rename: dict | None = None):
         buf += chunk or b""
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
-            yield _rewrite_sse_line(line, router_model, rename) + b"\n"
+            yield _rewrite_sse_line(line, router_model, rename, sink) + b"\n"
     if buf:
-        yield _rewrite_sse_line(buf, router_model)
+        yield _rewrite_sse_line(buf, router_model, None, sink)
 
 
-def proxy_sse_response(upstream_resp, router_model: str, rename: dict | None = None) -> Response:
-    """Relay the upstream SSE stream to the client as-is (model name fixed)."""
+def proxy_sse_response(upstream_resp, router_model: str, rename: dict | None = None,
+                       on_done=None) -> Response:
+    """Relay the upstream SSE stream to the client as-is (model name fixed).
+
+    `on_done(sink)` runs when the stream ends so the caller can log real usage
+    (or an estimate when the upstream never sends a usage chunk).
+    """
+    sink = _sse_sink()
+
     def gen():
         try:
             yield from rewrite_sse_model(
-                upstream_resp.iter_content(chunk_size=4096), router_model, rename)
+                upstream_resp.iter_content(chunk_size=4096), router_model, rename, sink)
         finally:
             _close_quietly(upstream_resp)
+            if callable(on_done):
+                try:
+                    on_done(sink)
+                except Exception:  # noqa: BLE001 - logging must never break the stream
+                    pass
 
     return Response(stream_with_context(gen()), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -4754,6 +4817,12 @@ def create_app() -> Flask:
                 apply_thinking_default(up_body, "openai", _tmode)
                 thinking = ensure_openai_reasoning_replay(
                     up_body, upstream, target.get("provider_id") or "", _tmode) or thinking
+                if stream:
+                    # Ask for the final usage chunk; unsupported gateways are
+                    # retried below without it.
+                    _so = up_body.get("stream_options")
+                    up_body["stream_options"] = {
+                        **(_so if isinstance(_so, dict) else {}), "include_usage": True}
                 oc: dict = {}
                 _entry, resp = call_upstream(
                     "openai", up_body, stream=stream or bool(oc.get("forced_stream")),
@@ -4762,6 +4831,13 @@ def create_app() -> Flask:
                 # OpenCode free lane always streams upstream; aggregate for
                 # clients that asked for a single JSON response.
                 oc_streamed = bool(oc.get("forced_stream")) and not stream
+                if resp.status_code == 400 and stream and "stream_options" in up_body:
+                    _close_quietly(resp)
+                    retry_body = dict(up_body)
+                    retry_body.pop("stream_options", None)
+                    _entry, resp = call_upstream(
+                        "openai", retry_body, stream=True, timeout=STREAM_TIMEOUT,
+                        provider=target.get("provider_id") or "", oc_state=oc)
                 if resp.status_code == 400 and not stream and not oc_streamed:
                     retry_body, removed = sanitize_openai_body_for_retry(up_body)
                     if removed:
@@ -4782,9 +4858,15 @@ def create_app() -> Flask:
                     return forward_upstream_error("openai", resp)
                 rename = oc.get("rename") or {}
                 if stream:
-                    add_log(ep, router_model, True, int((time.time() - t0) * 1000),
-                            "", 0, 0, kid, klabel, provider, thinking)
-                    return proxy_sse_response(resp, router_model, rename)
+                    def _stream_done(sink):
+                        pin, pout = usage_token_pair(sink.get("usage"))
+                        add_log(ep, router_model, True,
+                                int((time.time() - t0) * 1000), "",
+                                pin, pout, kid, klabel, provider,
+                                thinking or bool(sink.get("reason_chars", 0)))
+
+                    return proxy_sse_response(resp, router_model, rename,
+                                              on_done=_stream_done)
                 if oc_streamed:
                     try:
                         j = aggregate_openai_sse(resp, router_model, rename)
@@ -4796,23 +4878,21 @@ def create_app() -> Flask:
                         return jsonify({"error": {"message": f"upstream stream error: {exc}",
                                                   "type": "server_error"}}), 502
                     u = j.get("usage", {}) or {}
-                    thinking = thinking or bool(
-                        ((j.get("choices") or [{}])[0].get("message") or {}).get("reasoning_content"))
+                    msg = (j.get("choices") or [{}])[0].get("message") or {}
+                    pin, pout = usage_token_pair(u)
+                    thinking = thinking or bool(msg.get("reasoning_content"))
                     add_log(ep, router_model, True, int((time.time() - t0) * 1000), "",
-                            int(u.get("prompt_tokens", 0) or 0),
-                            int(u.get("completion_tokens", 0) or 0),
-                            kid, klabel, provider, thinking)
+                            pin, pout, kid, klabel, provider, thinking)
                     cache_store_response(target.get("provider_id") or "", upstream, j)
                     return jsonify(j)
                 j = resp.json()
                 j["model"] = router_model
                 u = j.get("usage", {}) or {}
-                thinking = thinking or bool(
-                    ((j.get("choices") or [{}])[0].get("message") or {}).get("reasoning_content"))
+                msg = (j.get("choices") or [{}])[0].get("message") or {}
+                pin, pout = usage_token_pair(u)
+                thinking = thinking or bool(msg.get("reasoning_content"))
                 add_log(ep, router_model, True, int((time.time() - t0) * 1000), "",
-                        int(u.get("prompt_tokens", 0) or 0),
-                        int(u.get("completion_tokens", 0) or 0),
-                        kid, klabel, provider, thinking)
+                        pin, pout, kid, klabel, provider, thinking)
                 if not stream:
                     cache_store_response(target.get("provider_id") or "", upstream, j)
                 return jsonify(j)
@@ -4885,12 +4965,12 @@ def create_app() -> Flask:
                              provider=target.get("provider_id") or "")
             oai = gemini_to_openai_response(g, router_model)
             u = (oai.get("usage") or {})
-            thinking = thinking or bool(
-                (oai.get("choices") or [{}])[0].get("message", {}).get("reasoning_content"))
+            msg = (oai.get("choices") or [{}])[0].get("message") or {}
+            pin, pout = usage_token_pair(u)
+            thinking = thinking or bool(msg.get("reasoning_content"))
             add_log(ep, router_model, True,
                     int((time.time() - t0) * 1000), "",
-                    int(u.get("prompt_tokens", 0) or 0), int(u.get("completion_tokens", 0) or 0),
-                    kid, klabel, provider, thinking)
+                    pin, pout, kid, klabel, provider, thinking)
             if stream:
                 return Response(
                     stream_with_context(iter_openai_sse(oai)),
@@ -4980,9 +5060,15 @@ def create_app() -> Flask:
                             0, 0, kid, klabel, provider, thinking)
                     return forward_upstream_error("anthropic", resp)
                 if stream:
-                    add_log(ep, router_model, True, int((time.time() - t0) * 1000),
-                            "", 0, 0, kid, klabel, provider, thinking)
-                    return proxy_sse_response(resp, router_model)
+                    def _stream_done(sink):
+                        pin, pout = usage_token_pair(sink.get("usage"))
+                        add_log(ep, router_model, True,
+                                int((time.time() - t0) * 1000), "",
+                                pin, pout, kid, klabel, provider,
+                                thinking or bool(sink.get("reason_chars", 0)))
+
+                    return proxy_sse_response(resp, router_model,
+                                              on_done=_stream_done)
                 j = resp.json()
                 j["model"] = router_model
                 u = j.get("usage", {}) or {}
@@ -5050,10 +5136,9 @@ def create_app() -> Flask:
                     isinstance(b, dict) and b.get("type") == "thinking"
                     for b in anth.get("content", []) or [])
                 u = anth.get("usage", {}) or {}
+                pin, pout = usage_token_pair(u)
                 add_log(ep, router_model, True, int((time.time() - t0) * 1000), "",
-                        int(u.get("input_tokens", 0) or 0),
-                        int(u.get("output_tokens", 0) or 0),
-                        kid, klabel, provider, thinking)
+                        pin, pout, kid, klabel, provider, thinking)
                 if stream:
                     return Response(
                         stream_with_context(iter_anthropic_sse(anth)),
